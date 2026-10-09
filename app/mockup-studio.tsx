@@ -35,6 +35,15 @@ type Artwork = { id: string; file: File; previewUrl: string }
 type ExportFormat = 'png' | 'jpg'
 type StoredMockup = { name: string; data: ArrayBuffer; targetId: string }
 type StoredProject = { id: string; name: string; updatedAt: number; mockups: StoredMockup[] }
+type BackupManifest = {
+  format: 'atelier-mockup-library'
+  version: 1
+  createdAt: number
+  collections: Array<{
+    name: string
+    mockups: Array<{ name: string; targetId: string; path: string }>
+  }>
+}
 type ViewMode = 'single' | 'grid'
 
 const layerKeywords = /clip|mask|design|artwork|art\b|print|placeholder|insert/i
@@ -499,9 +508,11 @@ export default function MockupStudio() {
   const [viewMode, setViewMode] = useState<ViewMode>('single')
   const [busy, setBusy] = useState(false)
   const [databaseReady, setDatabaseReady] = useState(false)
+  const [storagePersistent, setStoragePersistent] = useState<boolean | null>(null)
   const [projectDialogOpen, setProjectDialogOpen] = useState(false)
   const [newProjectName, setNewProjectName] = useState('')
   const [message, setMessage] = useState('')
+  const backupInputRef = useRef<HTMLInputElement>(null)
 
   const activeProject = projects.find((project) => project.id === activeProjectId)
   const selectedMockup = mockups.find((item) => item.id === selectedMockupId) || mockups[0]
@@ -540,6 +551,26 @@ export default function MockupStudio() {
       }
     }
     restoreProjects()
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function requestPersistentStorage() {
+      const storage = navigator.storage
+      if (!storage?.persisted || !storage.persist) {
+        if (!cancelled) setStoragePersistent(false)
+        return
+      }
+      try {
+        const alreadyPersistent = await storage.persisted()
+        const granted = alreadyPersistent || await storage.persist()
+        if (!cancelled) setStoragePersistent(granted)
+      } catch {
+        if (!cancelled) setStoragePersistent(false)
+      }
+    }
+    void requestPersistentStorage()
     return () => { cancelled = true }
   }, [])
 
@@ -594,23 +625,121 @@ export default function MockupStudio() {
     }
   }
 
-  async function removeActiveProject() {
-    if (!activeProject || projects.length < 2 || busy) return
-    const remaining = projects.filter((item) => item.id !== activeProject.id)
+  async function removeProject(id: string) {
+    const project = projects.find((item) => item.id === id)
+    if (!project || projects.length < 2 || busy) return
+    const confirmed = window.confirm(`Eliminar a coleção “${project.name}” e os ${project.mockups.length} PSD guardados nela? Esta ação não pode ser anulada.`)
+    if (!confirmed) return
+    const remaining = projects.filter((item) => item.id !== project.id)
+    setDatabaseReady(false)
     try {
-      await deleteStoredProject(activeProject.id)
+      await deleteStoredProject(project.id)
       setProjects(remaining)
-      const next = remaining[0]
-      setDatabaseReady(false)
-      artworks.forEach((artwork) => URL.revokeObjectURL(artwork.previewUrl))
-      setArtworks([]); setSelectedArtworkId(undefined)
-      const restored = await Promise.all(next.mockups.map(async (entry) => parseMockup(new File([entry.data], entry.name, { type: 'image/vnd.adobe.photoshop' }), entry.data, entry.targetId).catch(() => undefined)))
-      setMockups(restored.filter((item): item is Mockup => Boolean(item)))
-      setSelectedMockupId(restored.find((item) => item)?.id)
-      setActiveProjectId(next.id); setDatabaseReady(true)
+      if (project.id === activeProjectId) {
+        const next = remaining[0]
+        artworks.forEach((artwork) => URL.revokeObjectURL(artwork.previewUrl))
+        setArtworks([]); setSelectedArtworkId(undefined)
+        const restored = await Promise.all(next.mockups.map(async (entry) => parseMockup(new File([entry.data], entry.name, { type: 'image/vnd.adobe.photoshop' }), entry.data, entry.targetId).catch(() => undefined)))
+        setMockups(restored.filter((item): item is Mockup => Boolean(item)))
+        setSelectedMockupId(restored.find((item) => item)?.id)
+        setActiveProjectId(next.id)
+      }
     } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Não foi possível eliminar esta coleção.')
+    } finally {
       setDatabaseReady(true)
-      setMessage(error instanceof Error ? error.message : 'Não foi possível eliminar este projeto.')
+    }
+  }
+
+  async function exportLibraryBackup() {
+    if (busy || !databaseReady) return
+    setBusy(true)
+    setMessage('A preparar a cópia de segurança…')
+    try {
+      const savedProjects = await readStoredProjects()
+      const stored = savedProjects.map((project) => project.id === activeProjectId
+        ? { ...project, updatedAt: Date.now(), mockups: mockups.map(({ file, data, targetId }) => ({ name: file.name, data, targetId })) }
+        : project)
+      if (!stored.length) throw new Error('Ainda não existem coleções para guardar.')
+      const zip = new JSZip()
+      const collections = stored.map((project, projectIndex) => ({
+        name: project.name,
+        mockups: project.mockups.map((mockup, mockupIndex) => {
+          const path = `collections/${projectIndex + 1}/${mockupIndex + 1}.psd`
+          zip.file(path, mockup.data)
+          return { name: mockup.name, targetId: mockup.targetId, path }
+        }),
+      }))
+      const manifest: BackupManifest = { format: 'atelier-mockup-library', version: 1, createdAt: Date.now(), collections }
+      zip.file('manifest.json', JSON.stringify(manifest, null, 2))
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE', streamFiles: true })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `atelier-biblioteca-${new Date().toISOString().slice(0, 10)}.zip`
+      anchor.click()
+      URL.revokeObjectURL(url)
+      setMessage(`Cópia criada com ${stored.length} ${stored.length === 1 ? 'coleção' : 'coleções'} e os respetivos PSDs.`)
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Não foi possível criar a cópia de segurança.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function importLibraryBackup(files: FileList | null) {
+    const file = files?.[0]
+    if (!file || busy) return
+    setBusy(true)
+    setMessage('A restaurar a biblioteca…')
+    try {
+      const zip = await JSZip.loadAsync(file)
+      const manifestFile = zip.file('manifest.json')
+      if (!manifestFile) throw new Error('A cópia não contém o ficheiro manifest.json.')
+      const manifest = JSON.parse(await manifestFile.async('string')) as Partial<BackupManifest>
+      if (manifest.format !== 'atelier-mockup-library' || manifest.version !== 1 || !Array.isArray(manifest.collections)) {
+        throw new Error('Este ficheiro não é uma cópia de segurança Atelier válida.')
+      }
+
+      const existingProjects = await readStoredProjects()
+      const names = new Set(existingProjects.map((project) => project.name.toLocaleLowerCase()))
+      const restored: StoredProject[] = []
+      for (const [collectionIndex, collection] of manifest.collections.entries()) {
+        if (!collection || typeof collection.name !== 'string' || !Array.isArray(collection.mockups)) {
+          throw new Error('A cópia contém uma coleção inválida.')
+        }
+        const baseName = collection.name.trim() || `Coleção ${collectionIndex + 1}`
+        let name = baseName
+        let suffix = 2
+        while (names.has(name.toLocaleLowerCase())) name = `${baseName} (${suffix++})`
+        names.add(name.toLocaleLowerCase())
+        const mockups: StoredMockup[] = []
+        for (const [mockupIndex, entry] of collection.mockups.entries()) {
+          const expectedPrefix = `collections/${collectionIndex + 1}/`
+          if (!entry || typeof entry.name !== 'string' || typeof entry.path !== 'string' || !entry.path.startsWith(expectedPrefix) || !entry.path.toLowerCase().endsWith('.psd')) {
+            throw new Error('A cópia contém um caminho de PSD inválido.')
+          }
+          const archivedFile = zip.file(entry.path)
+          if (!archivedFile || archivedFile.dir) throw new Error(`Falta o PSD “${entry.name}” na cópia.`)
+          const data = await archivedFile.async('arraybuffer')
+          if (!data.byteLength) throw new Error(`O PSD “${entry.name}” está vazio na cópia.`)
+          mockups.push({ name: entry.name, data, targetId: typeof entry.targetId === 'string' ? entry.targetId : '' })
+        }
+        const project: StoredProject = {
+          id: `collection-${Date.now()}-${collectionIndex}-${Math.random().toString(36).slice(2)}`,
+          name,
+          updatedAt: Date.now(),
+          mockups,
+        }
+        await saveStoredProject(project)
+        restored.push(project)
+      }
+      setProjects((current) => [...restored, ...current])
+      setMessage(`Biblioteca restaurada: ${restored.length} ${restored.length === 1 ? 'coleção' : 'coleções'}.`)
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Não foi possível restaurar esta cópia de segurança.')
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -724,26 +853,42 @@ export default function MockupStudio() {
 
       <div className="workspace">
         <aside className="sidebar">
-          <div className="sidebar-section-heading"><span>ESPAÇO DE TRABALHO</span><button type="button" className="icon-button" aria-label="Adicionar mockup" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}><Plus size={16} /></button></div>
-          <div className="sidebar-nav-item active"><FolderOpen size={17} /><span>Os meus mockups</span><span className="nav-count">{mockups.length}</span></div>
-          <div className="sidebar-list-label">COLEÇÃO <span>{mockups.length.toString().padStart(2, '0')}</span></div>
+          <div className="sidebar-section-heading"><span>AS MINHAS COLEÇÕES</span><button type="button" className="icon-button" aria-label="Criar coleção" title="Criar coleção" onClick={() => setProjectDialogOpen(true)}><Plus size={16} /></button></div>
+          <nav className="collection-nav" aria-label="Coleções">
+            {projects.map((project) => (
+              <div className={`collection-nav-row${project.id === activeProjectId ? ' collection-nav-row-active' : ''}`} key={project.id}>
+                <button className="collection-nav-button" type="button" title={project.name} aria-current={project.id === activeProjectId ? 'page' : undefined} disabled={busy && project.id !== activeProjectId} onClick={() => void switchProject(project.id)}>
+                  <FolderOpen className="collection-nav-icon" size={16} />
+                  <span className="collection-nav-copy"><strong>{project.name}</strong><small>{project.mockups.length} {project.mockups.length === 1 ? 'mockup' : 'mockups'}</small></span>
+                  <span className="collection-nav-count">{project.mockups.length}</span>
+                </button>
+                {projects.length > 1 && <button className="collection-remove" type="button" aria-label={`Eliminar coleção ${project.name}`} title={`Eliminar coleção ${project.name}`} disabled={busy} onClick={() => void removeProject(project.id)}><X size={13} /></button>}
+              </div>
+            ))}
+          </nav>
+          <div className="sidebar-list-label">MOCKUPS <span>{mockups.length.toString().padStart(2, '0')}</span></div>
           {mockups.length ? <div className="mockup-list">{mockups.map((mockup) => (
             <button className={`mockup-list-item${selectedMockup?.id === mockup.id ? ' selected' : ''}`} key={mockup.id} onClick={() => setSelectedMockupId(mockup.id)} type="button">
               <span className="list-thumb"><img src={mockup.previewUrl} alt="" /></span>
               <span className="list-file-info"><strong>{mockup.file.name.replace(/\.psd$/i, '')}</strong><small>{mockup.width} × {mockup.height}</small></span>
               <span className="list-dot" />
             </button>
-          ))}</div> : <div className="sidebar-empty">Os teus mockups PSD vão aparecer aqui.</div>}
+          ))}</div> : <div className="sidebar-empty">Adiciona PSDs a esta coleção.</div>}
           <div className="sidebar-upload" id="mockup-upload-trigger">
             <Dropzone title="Adicionar mockups" subtitle="Arrasta ficheiros .psd ou procura" accept=".psd,image/vnd.adobe.photoshop" multiple onFiles={addMockupFiles} compact />
           </div>
-          <div className="sidebar-footer"><span className="privacy-icon"><Check size={13} /></span><span><strong>Privado por natureza</strong><small>Os ficheiros não saem do teu dispositivo.</small></span></div>
+          <div className="sidebar-footer"><span className="privacy-icon"><Check size={13} /></span><span><strong>{storagePersistent ? 'Armazenamento protegido' : 'Guardado neste browser'}</strong><small>Os PSDs não saem do teu dispositivo.</small></span></div>
+          <div className="sidebar-backup-actions">
+            <button type="button" onClick={() => void exportLibraryBackup()} disabled={busy || !databaseReady}><ArrowDownToLine size={13} /> Fazer cópia</button>
+            <button type="button" onClick={() => backupInputRef.current?.click()} disabled={busy}><Upload size={13} /> Restaurar</button>
+            <input ref={backupInputRef} className="sr-only" type="file" accept=".zip,application/zip" aria-label="Selecionar cópia da biblioteca" onChange={(event) => { void importLibraryBackup(event.target.files); event.target.value = '' }} />
+          </div>
         </aside>
 
         <section className="main-panel" id="inicio">
           <div className="page-heading">
             <div><div className="eyebrow"><span>WORKSPACE</span><span className="eyebrow-slash">/</span><span>{activeProject?.name || 'MOCKUP STUDIO'}</span></div><h1>Mockup studio<span>.</span></h1><p>As tuas ilustrações, no lugar certo.</p></div>
-            <div className="page-actions"><div className="project-switcher"><span>PROJETO</span><select aria-label="Projeto ativo" value={activeProjectId || ''} onChange={(event) => switchProject(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button type="button" aria-label="Criar projeto" title="Criar projeto" onClick={() => setProjectDialogOpen(true)}><Plus size={15} /></button><button type="button" aria-label="Eliminar projeto atual" title={projects.length > 1 ? 'Eliminar projeto atual' : 'Cria outro projeto antes de eliminar este'} disabled={projects.length < 2 || busy} onClick={removeActiveProject}><X size={14} /></button></div><span className="collection-status"><span />{mockups.length ? `${mockups.length} mockup${mockups.length === 1 ? '' : 's'} na coleção` : 'Coleção guardada localmente'}</span><button type="button" className="button button-secondary" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}><Plus size={16} /> Adicionar PSD</button></div>
+            <div className="page-actions"><span className="collection-status"><span />{mockups.length ? `${mockups.length} mockup${mockups.length === 1 ? '' : 's'} nesta coleção` : 'Coleção guardada localmente'}</span><button type="button" className="button button-secondary" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}><Plus size={16} /> Adicionar PSD</button></div>
           </div>
 
           <div className="stepper" aria-label="Etapas de trabalho">
@@ -783,13 +928,13 @@ export default function MockupStudio() {
                   <p className="export-note">Alta resolução · um ZIP organizado por mockup</p>
                 </div>
               </div>
-              <div className="privacy-note"><span><Check size={14} /></span><p><strong>Mockups guardados neste browser.</strong> As ilustrações são temporárias e não ficam guardadas.</p></div>
+              <div className="privacy-note"><span><Check size={14} /></span><p><strong>PSD guardados neste browser.</strong> Faz uma cópia de segurança ZIP e restaura-a noutro dispositivo. As ilustrações continuam temporárias.</p></div>
             </aside>
           </div>
           <footer className="workspace-footer"><span>atelier<span className="footer-dot">.</span> <span className="footer-version">MOCKUP STUDIO</span></span><span>{mockups.length} PSD <i /> {artworks.length} imagens prontas</span></footer>
         </section>
       </div>
-      {projectDialogOpen && <div className="project-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProjectDialogOpen(false) }}><section className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title"><button type="button" className="dialog-close" aria-label="Fechar" onClick={() => setProjectDialogOpen(false)}><X size={16} /></button><span className="dialog-eyebrow">NOVA COLEÇÃO</span><h2 id="new-project-title">Criar projeto</h2><p>Organiza os teus mockups por produto, campanha ou coleção.</p><form onSubmit={(event) => { event.preventDefault(); void createProject() }}><label htmlFor="project-name">Nome do projeto</label><input id="project-name" autoFocus maxLength={50} placeholder="Ex.: T-shirts" value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} /><div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setProjectDialogOpen(false)}>Cancelar</button><button type="submit" className="button button-primary" disabled={!newProjectName.trim()}>Criar projeto</button></div></form></section></div>}
+      {projectDialogOpen && <div className="project-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProjectDialogOpen(false) }}><section className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title"><button type="button" className="dialog-close" aria-label="Fechar" onClick={() => setProjectDialogOpen(false)}><X size={16} /></button><span className="dialog-eyebrow">NOVA COLEÇÃO</span><h2 id="new-project-title">Criar coleção</h2><p>Organiza os teus mockups por produto, campanha ou tema.</p><form onSubmit={(event) => { event.preventDefault(); void createProject() }}><label htmlFor="project-name">Nome da coleção</label><input id="project-name" autoFocus maxLength={50} placeholder="Ex.: T-shirts" value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} /><div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setProjectDialogOpen(false)}>Cancelar</button><button type="submit" className="button button-primary" disabled={!newProjectName.trim()}>Criar coleção</button></div></form></section></div>}
       {busy && <div className="loading-overlay" aria-live="polite"><LoaderCircle className="spin" size={22} /><span>A processar ficheiros no browser…</span></div>}
     </main>
   )
