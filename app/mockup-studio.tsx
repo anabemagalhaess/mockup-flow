@@ -422,6 +422,108 @@ function analyzeMask(mask: HTMLCanvasElement) {
   }
 }
 
+function detectColorKeyMask(composite: HTMLCanvasElement, width: number, height: number) {
+  const scale = Math.min(1, 900 / Math.max(width, height))
+  const sampleWidth = Math.max(1, Math.round(width * scale))
+  const sampleHeight = Math.max(1, Math.round(height * scale))
+  const sample = document.createElement('canvas')
+  sample.width = sampleWidth
+  sample.height = sampleHeight
+  const sampleContext = sample.getContext('2d', { willReadFrequently: true })
+  if (!sampleContext) return undefined
+  sampleContext.drawImage(composite, 0, 0, sampleWidth, sampleHeight)
+
+  const pixels = sampleContext.getImageData(0, 0, sampleWidth, sampleHeight)
+  const pixelCount = sampleWidth * sampleHeight
+  const candidates = new Uint8Array(pixelCount)
+  for (let index = 0; index < pixelCount; index += 1) {
+    const offset = index * 4
+    const red = pixels.data[offset]
+    const green = pixels.data[offset + 1]
+    const blue = pixels.data[offset + 2]
+    const chroma = Math.max(red, green, blue) - Math.min(red, green, blue)
+    if (green > 72 && green > red * 1.18 && blue > red * 1.12 && blue > green * 0.68 && blue < green * 1.42 && chroma > 22) {
+      candidates[index] = 1
+    }
+  }
+
+  const visited = new Uint8Array(pixelCount)
+  const queue = new Int32Array(pixelCount)
+  let largestComponent = new Int32Array(0)
+  for (let start = 0; start < pixelCount; start += 1) {
+    if (!candidates[start] || visited[start]) continue
+    let head = 0
+    let tail = 0
+    queue[tail++] = start
+    visited[start] = 1
+    const addNeighbor = (neighbor: number) => {
+      if (neighbor < 0 || neighbor >= pixelCount || !candidates[neighbor] || visited[neighbor]) return
+      visited[neighbor] = 1
+      queue[tail++] = neighbor
+    }
+    while (head < tail) {
+      const current = queue[head++]
+      const x = current % sampleWidth
+      if (current >= sampleWidth) addNeighbor(current - sampleWidth)
+      if (current + sampleWidth < pixelCount) addNeighbor(current + sampleWidth)
+      if (x > 0) addNeighbor(current - 1)
+      if (x < sampleWidth - 1) addNeighbor(current + 1)
+    }
+    if (tail > largestComponent.length) largestComponent = queue.slice(0, tail)
+  }
+
+  if (largestComponent.length < Math.max(40, pixelCount * 0.003) || largestComponent.length > pixelCount * 0.75) return undefined
+  const componentPixels = new Uint8ClampedArray(pixelCount * 4)
+  for (const index of largestComponent) componentPixels[index * 4 + 3] = 255
+  const sampleMask = document.createElement('canvas')
+  sampleMask.width = sampleWidth
+  sampleMask.height = sampleHeight
+  const maskContext = sampleMask.getContext('2d', { willReadFrequently: true })
+  if (!maskContext) return undefined
+  maskContext.putImageData(new ImageData(componentPixels, sampleWidth, sampleHeight), 0, 0)
+
+  const sampledGeometry = analyzeMask(sampleMask)
+  if (!sampledGeometry?.bounds || !sampledGeometry.corners) return undefined
+  const polygonArea = Math.abs(sampledGeometry.corners.reduce((area, point, index, corners) => {
+    const next = corners[(index + 1) % corners.length]
+    return area + point.x * next.y - next.x * point.y
+  }, 0)) / 2
+  const areaRatio = polygonArea / largestComponent.length
+  const planeWidth = (Math.hypot(sampledGeometry.corners[1].x - sampledGeometry.corners[0].x, sampledGeometry.corners[1].y - sampledGeometry.corners[0].y)
+    + Math.hypot(sampledGeometry.corners[2].x - sampledGeometry.corners[3].x, sampledGeometry.corners[2].y - sampledGeometry.corners[3].y)) / 2
+  const planeHeight = (Math.hypot(sampledGeometry.corners[3].x - sampledGeometry.corners[0].x, sampledGeometry.corners[3].y - sampledGeometry.corners[0].y)
+    + Math.hypot(sampledGeometry.corners[2].x - sampledGeometry.corners[1].x, sampledGeometry.corners[2].y - sampledGeometry.corners[1].y)) / 2
+  const aspectRatio = planeWidth / planeHeight
+  if (areaRatio < 0.72 || areaRatio > 2.1 || aspectRatio < 0.2 || aspectRatio > 5) return undefined
+
+  const alphaMask = document.createElement('canvas')
+  alphaMask.width = width
+  alphaMask.height = height
+  const alphaContext = alphaMask.getContext('2d')
+  if (!alphaContext) return undefined
+  alphaContext.imageSmoothingEnabled = true
+  alphaContext.drawImage(sampleMask, 0, 0, width, height)
+  return {
+    alphaMask,
+    geometry: {
+      bounds: {
+        left: sampledGeometry.bounds.left / sampleWidth * width,
+        top: sampledGeometry.bounds.top / sampleHeight * height,
+        width: sampledGeometry.bounds.width / sampleWidth * width,
+        height: sampledGeometry.bounds.height / sampleHeight * height,
+      },
+      corners: sampledGeometry.corners.map((point) => ({ x: point.x / sampleWidth * width, y: point.y / sampleHeight * height })),
+    },
+  }
+}
+
+function getPerspectiveAspectRatio(corners: MaskPoint[]) {
+  const edgeLength = (start: number, end: number) => Math.hypot(corners[end].x - corners[start].x, corners[end].y - corners[start].y)
+  const width = (edgeLength(0, 1) + edgeLength(3, 2)) / 2
+  const height = (edgeLength(0, 3) + edgeLength(1, 2)) / 2
+  return width / height
+}
+
 function createMockupPreview(composite: HTMLCanvasElement, width: number, height: number) {
   const scale = Math.min(1, 1400 / width, 1400 / height)
   const preview = document.createElement('canvas')
@@ -577,10 +679,11 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   if (!target) throw new Error('Escolhe uma camada de destino válida.')
 
   const clippingBase = findClippingBase(mockup.layers, targetIndex)
-  const clippingBaseMask = target.clipping && clippingBase
-    ? makeAlphaMask(clippingBase, mockup.width, mockup.height) || makeLayerAlphaMask(clippingBase, mockup.width, mockup.height)
-    : undefined
-  let alphaMask = clippingBaseMask || makeAlphaMask(target, mockup.width, mockup.height) || makeLayerAlphaMask(target, mockup.width, mockup.height)
+  const explicitMask = target.clipping && clippingBase
+    ? makeAlphaMask(clippingBase, mockup.width, mockup.height)
+    : makeAlphaMask(target, mockup.width, mockup.height)
+  const colorKey = explicitMask ? undefined : detectColorKeyMask(mockup.composite, mockup.width, mockup.height)
+  let alphaMask = explicitMask || colorKey?.alphaMask || makeLayerAlphaMask(target, mockup.width, mockup.height)
   let replacedLayer: Layer | undefined
   if (!alphaMask && clippingBase) {
     alphaMask = makeAlphaMask(clippingBase, mockup.width, mockup.height) || makeLayerAlphaMask(clippingBase, mockup.width, mockup.height)
@@ -594,7 +697,7 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   if (!alphaMask) alphaMask = makeLayerBoundsAlphaMask(target, mockup.width, mockup.height)
   if (!alphaMask) throw new Error(`A camada “${target.name || 'selecionada'}” não tem uma forma nem limites de recorte no PSD.`)
 
-  const geometry = analyzeMask(alphaMask)
+  const geometry = colorKey && alphaMask === colorKey.alphaMask ? colorKey.geometry : analyzeMask(alphaMask)
   if (!geometry) throw new Error('Não foi possível ler a máscara da camada de destino.')
   if (!geometry.bounds) throw new Error(`A máscara da camada “${target.name || 'selecionada'}” está vazia.`)
   const bounds = geometry.bounds
@@ -616,10 +719,12 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
     for (let index = mockup.layers.length - 1; index > targetIndex; index -= 1) drawLayer(mockup.layers[index])
   }
 
+  const perspectiveCorners = geometry.corners
   const bitmap = await createImageBitmap(artwork.file)
   const art = document.createElement('canvas')
-  art.width = Math.max(1, Math.round(bounds.width))
-  art.height = Math.max(1, Math.round(bounds.height))
+  const planeRatio = perspectiveCorners ? getPerspectiveAspectRatio(perspectiveCorners) : bounds.width / bounds.height
+  art.width = 1200
+  art.height = Math.max(1, Math.round(1200 / Math.min(5, Math.max(0.2, planeRatio))))
   const artContext = art.getContext('2d')
   if (!artContext) { bitmap.close(); throw new Error('Não foi possível preparar a ilustração.') }
   fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height)
@@ -630,7 +735,6 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   clippedArt.height = output.height
   const clippedContext = clippedArt.getContext('2d')
   if (!clippedContext) throw new Error('Não foi possível preparar a área de recorte.')
-  const perspectiveCorners = geometry.corners
   const perspectiveApplied = perspectiveCorners ? drawPerspective(clippedContext, art, perspectiveCorners) : false
   if (!perspectiveApplied) clippedContext.drawImage(art, bounds.left, bounds.top)
   clippedContext.globalCompositeOperation = 'destination-in'
