@@ -286,6 +286,122 @@ function findClippingBase(layers: Layer[], layerIndex: number) {
   return layers.slice(layerIndex + 1).find((layer) => !layer.clipping && (toCanvas(layer) || layerHasMask(layer) || ((layer.right ?? 0) > (layer.left ?? 0) && (layer.bottom ?? 0) > (layer.top ?? 0))))
 }
 
+type MaskPoint = { x: number; y: number }
+
+function simplifyMaskEdge(points: MaskPoint[], tolerance: number) {
+  if (points.length <= 2) return points
+  const keep = new Uint8Array(points.length)
+  keep[0] = 1
+  keep[points.length - 1] = 1
+  const pending: [number, number][] = [[0, points.length - 1]]
+  const toleranceSquared = tolerance * tolerance
+
+  while (pending.length) {
+    const [start, end] = pending.pop()!
+    const first = points[start]
+    const last = points[end]
+    const dx = last.x - first.x
+    const dy = last.y - first.y
+    let farthest = -1
+    let maximumDistance = toleranceSquared
+
+    for (let index = start + 1; index < end; index += 1) {
+      const point = points[index]
+      const distance = dx === 0 && dy === 0
+        ? (point.x - first.x) ** 2 + (point.y - first.y) ** 2
+        : ((point.x - first.x) * dy - (point.y - first.y) * dx) ** 2 / (dx * dx + dy * dy)
+      if (distance > maximumDistance) {
+        maximumDistance = distance
+        farthest = index
+      }
+    }
+
+    if (farthest >= 0) {
+      keep[farthest] = 1
+      pending.push([start, farthest], [farthest, end])
+    }
+  }
+
+  return points.filter((_, index) => keep[index])
+}
+
+function maskConvexHull(points: MaskPoint[]) {
+  const sorted = points.sort((first, second) => first.x - second.x || first.y - second.y)
+  const cross = (origin: MaskPoint, first: MaskPoint, second: MaskPoint) =>
+    (first.x - origin.x) * (second.y - origin.y) - (first.y - origin.y) * (second.x - origin.x)
+  const lower: MaskPoint[] = []
+  const upper: MaskPoint[] = []
+
+  for (const point of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) lower.pop()
+    lower.push(point)
+  }
+  for (let index = sorted.length - 1; index >= 0; index -= 1) {
+    const point = sorted[index]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) upper.pop()
+    upper.push(point)
+  }
+  lower.pop()
+  upper.pop()
+  return lower.concat(upper)
+}
+
+function findPerspectiveCorners(data: Uint8ClampedArray, width: number, height: number): MaskPoint[] | undefined {
+  const outline: MaskPoint[] = []
+  const isInside = (x: number, y: number) => x >= 0 && x < width && y >= 0 && y < height && data[(y * width + x) * 4 + 3] >= 128
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      if (!isInside(x, y)) continue
+      if (!isInside(x - 1, y) || !isInside(x + 1, y) || !isInside(x, y - 1) || !isInside(x, y + 1)) outline.push({ x: x + 0.5, y: y + 0.5 })
+    }
+  }
+  if (outline.length < 4) return undefined
+
+  const hull = maskConvexHull(outline)
+  if (hull.length < 4) return undefined
+  const first = hull[0]
+  let secondIndex = 1
+  for (let index = 2; index < hull.length; index += 1) {
+    const candidate = hull[index]
+    const current = hull[secondIndex]
+    if ((candidate.x - first.x) ** 2 + (candidate.y - first.y) ** 2 > (current.x - first.x) ** 2 + (current.y - first.y) ** 2) secondIndex = index
+  }
+  const second = hull[secondIndex]
+  let oppositeIndex = secondIndex
+  for (let index = 0; index < hull.length; index += 1) {
+    const candidate = hull[index]
+    const current = hull[oppositeIndex]
+    if ((candidate.x - second.x) ** 2 + (candidate.y - second.y) ** 2 > (current.x - second.x) ** 2 + (current.y - second.y) ** 2) oppositeIndex = index
+  }
+
+  const followHull = (start: number, end: number, step: 1 | -1) => {
+    const edge: MaskPoint[] = []
+    for (let index = start; ; index = (index + step + hull.length) % hull.length) {
+      edge.push(hull[index])
+      if (index === end) break
+    }
+    return edge
+  }
+  const diagonal = Math.hypot(second.x - hull[oppositeIndex].x, second.y - hull[oppositeIndex].y)
+  let tolerance = Math.max(1, diagonal * 0.002)
+  while (tolerance <= diagonal * 0.035) {
+    const firstEdge = simplifyMaskEdge(followHull(secondIndex, oppositeIndex, 1), tolerance)
+    const secondEdge = simplifyMaskEdge(followHull(oppositeIndex, secondIndex, 1), tolerance)
+    const corners = [...firstEdge.slice(0, -1), ...secondEdge.slice(0, -1)]
+    if (corners.length === 4) {
+      const center = corners.reduce((sum, point) => ({ x: sum.x + point.x / 4, y: sum.y + point.y / 4 }), { x: 0, y: 0 })
+      const ordered = corners.sort((first, second) =>
+        Math.atan2(first.y - center.y, first.x - center.x) - Math.atan2(second.y - center.y, second.x - center.x))
+      const topLeft = ordered.reduce((best, point) => point.x + point.y < best.x + best.y ? point : best, ordered[0])
+      const topLeftIndex = ordered.indexOf(topLeft)
+      return [...ordered.slice(topLeftIndex), ...ordered.slice(0, topLeftIndex)]
+    }
+    tolerance *= 1.35
+  }
+  return undefined
+}
+
 function analyzeMask(mask: HTMLCanvasElement) {
   const context = mask.getContext('2d', { willReadFrequently: true })
   if (!context) return undefined
@@ -300,7 +416,10 @@ function analyzeMask(mask: HTMLCanvasElement) {
   }
 
   if (maxX < minX || maxY < minY) return undefined
-  return { bounds: { left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 } }
+  return {
+    bounds: { left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+    corners: findPerspectiveCorners(data, width, height),
+  }
 }
 
 function createMockupPreview(composite: HTMLCanvasElement, width: number, height: number) {
@@ -325,6 +444,110 @@ function fitImage(context: CanvasRenderingContext2D, image: CanvasImageSource, i
   const drawWidth = imageWidth * scale
   const drawHeight = imageHeight * scale
   context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight)
+}
+
+function solveLinearSystem(matrix: number[][], values: number[]) {
+  const rows = matrix.map((row, index) => [...row, values[index]])
+  const size = values.length
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column
+    for (let row = column + 1; row < size; row += 1) {
+      if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row
+    }
+    if (Math.abs(rows[pivot][column]) < 1e-10) return undefined
+    ;[rows[column], rows[pivot]] = [rows[pivot], rows[column]]
+    const divisor = rows[column][column]
+    for (let index = column; index <= size; index += 1) rows[column][index] /= divisor
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue
+      const factor = rows[row][column]
+      for (let index = column; index <= size; index += 1) rows[row][index] -= factor * rows[column][index]
+    }
+  }
+  return rows.map((row) => row[size])
+}
+
+function getPerspectiveTransform(source: MaskPoint[], destination: MaskPoint[]) {
+  const matrix: number[][] = []
+  const values: number[] = []
+  source.forEach(({ x, y }, index) => {
+    const { x: u, y: v } = destination[index]
+    matrix.push([x, y, 1, 0, 0, 0, -u * x, -u * y])
+    values.push(u)
+    matrix.push([0, 0, 0, x, y, 1, -v * x, -v * y])
+    values.push(v)
+  })
+  const solved = solveLinearSystem(matrix, values)
+  return solved ? [...solved, 1] : undefined
+}
+
+function projectPoint(transform: number[], point: MaskPoint): MaskPoint {
+  const divisor = transform[6] * point.x + transform[7] * point.y + 1
+  return {
+    x: (transform[0] * point.x + transform[1] * point.y + transform[2]) / divisor,
+    y: (transform[3] * point.x + transform[4] * point.y + transform[5]) / divisor,
+  }
+}
+
+function drawPerspective(context: CanvasRenderingContext2D, source: HTMLCanvasElement, corners: MaskPoint[]) {
+  const sourceCorners = [
+    { x: 0, y: 0 },
+    { x: source.width, y: 0 },
+    { x: source.width, y: source.height },
+    { x: 0, y: source.height },
+  ]
+  const transform = getPerspectiveTransform(sourceCorners, corners)
+  if (!transform) return false
+
+  const divisions = 24
+  const drawTriangle = (points: MaskPoint[]) => {
+    const projected = points.map((point) => projectPoint(transform, point))
+    const [first, second, third] = points
+    const [projectedFirst, projectedSecond, projectedThird] = projected
+    const affineX = solveLinearSystem(
+      [[first.x, first.y, 1], [second.x, second.y, 1], [third.x, third.y, 1]],
+      [projectedFirst.x, projectedSecond.x, projectedThird.x],
+    )
+    const affineY = solveLinearSystem(
+      [[first.x, first.y, 1], [second.x, second.y, 1], [third.x, third.y, 1]],
+      [projectedFirst.y, projectedSecond.y, projectedThird.y],
+    )
+    if (!affineX || !affineY) return
+
+    const center = projected.reduce((sum, point) => ({ x: sum.x + point.x / 3, y: sum.y + point.y / 3 }), { x: 0, y: 0 })
+    const clipPoints = projected.map((point) => {
+      const distance = Math.hypot(point.x - center.x, point.y - center.y) || 1
+      return { x: point.x + (point.x - center.x) * 0.35 / distance, y: point.y + (point.y - center.y) * 0.35 / distance }
+    })
+    const sourceLeft = Math.max(0, Math.min(...points.map((point) => point.x)) - 1)
+    const sourceTop = Math.max(0, Math.min(...points.map((point) => point.y)) - 1)
+    const sourceRight = Math.min(source.width, Math.max(...points.map((point) => point.x)) + 1)
+    const sourceBottom = Math.min(source.height, Math.max(...points.map((point) => point.y)) + 1)
+    if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) return
+
+    context.save()
+    context.beginPath()
+    context.moveTo(clipPoints[0].x, clipPoints[0].y)
+    context.lineTo(clipPoints[1].x, clipPoints[1].y)
+    context.lineTo(clipPoints[2].x, clipPoints[2].y)
+    context.closePath()
+    context.clip()
+    context.setTransform(affineX[0], affineY[0], affineX[1], affineY[1], affineX[2], affineY[2])
+    context.drawImage(source, sourceLeft, sourceTop, sourceRight - sourceLeft, sourceBottom - sourceTop, sourceLeft, sourceTop, sourceRight - sourceLeft, sourceBottom - sourceTop)
+    context.restore()
+  }
+
+  for (let row = 0; row < divisions; row += 1) {
+    for (let column = 0; column < divisions; column += 1) {
+      const left = source.width * column / divisions
+      const right = source.width * (column + 1) / divisions
+      const top = source.height * row / divisions
+      const bottom = source.height * (row + 1) / divisions
+      drawTriangle([{ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }])
+      drawTriangle([{ x: left, y: top }, { x: right, y: bottom }, { x: left, y: bottom }])
+    }
+  }
+  return true
 }
 
 async function parseMockup(file: File, data: ArrayBuffer, savedTargetId?: string): Promise<Mockup> {
@@ -404,7 +627,9 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   clippedArt.height = output.height
   const clippedContext = clippedArt.getContext('2d')
   if (!clippedContext) throw new Error('Não foi possível preparar a área de recorte.')
-  clippedContext.drawImage(art, bounds.left, bounds.top)
+  const perspectiveCorners = geometry.corners
+  const perspectiveApplied = perspectiveCorners ? drawPerspective(clippedContext, art, perspectiveCorners) : false
+  if (!perspectiveApplied) clippedContext.drawImage(art, bounds.left, bounds.top)
   clippedContext.globalCompositeOperation = 'destination-in'
   clippedContext.drawImage(alphaMask, 0, 0)
   context.drawImage(clippedArt, 0, 0)
