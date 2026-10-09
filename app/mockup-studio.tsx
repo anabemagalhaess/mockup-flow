@@ -26,6 +26,7 @@ type Mockup = {
   data: ArrayBuffer
   psd: Psd
   layers: PsdLayer[]
+  composite: HTMLCanvasElement
   targetId: string
   previewUrl: string
   width: number
@@ -102,10 +103,14 @@ function flattenLayers(layers: Layer[] = [], result: PsdLayer[] = []) {
   return result
 }
 
+function layerHasMask(layer: Layer) {
+  return Boolean(layer.mask?.canvas || layer.mask?.imageData || layer.vectorMask?.paths.length)
+}
+
 function findTarget(layers: PsdLayer[]) {
-  const namedMask = layers.find((layer) => layerKeywords.test(layer.name || '') && (layer.mask?.canvas || layer.mask?.imageData || layer.canvas || layer.imageData))
-  const clippedLayer = layers.find((layer) => layer.clipping && (layer.mask?.canvas || layer.mask?.imageData || layer.canvas || layer.imageData))
-  const maskedLayer = layers.find((layer) => layer.mask?.canvas || layer.mask?.imageData)
+  const namedMask = layers.find((layer) => layerKeywords.test(layer.name || '') && (layerHasMask(layer) || layer.canvas || layer.imageData))
+  const clippedLayer = layers.find((layer) => layer.clipping && (layerHasMask(layer) || layer.canvas || layer.imageData))
+  const maskedLayer = layers.find(layerHasMask)
   const namedLayer = layers.find((layer) => layerKeywords.test(layer.name || ''))
   const imageLayer = layers.find((layer) => layer.canvas || layer.imageData)
   return layerId(namedMask || clippedLayer || maskedLayer || namedLayer || imageLayer || layers[0])
@@ -127,31 +132,104 @@ function getMaskDocumentPosition(layer: Layer) {
     : { x: mask.left ?? layer.left ?? 0, y: mask.top ?? layer.top ?? 0 }
 }
 
-function makeAlphaMask(layer: Layer, width: number, height: number) {
-  const mask = layerMaskCanvas(layer)
-  if (!mask || layer.mask?.disabled) return undefined
-  const source = document.createElement('canvas')
-  source.width = mask.width
-  source.height = mask.height
-  const sourceContext = source.getContext('2d', { willReadFrequently: true })
-  if (!sourceContext) return undefined
-  sourceContext.drawImage(mask, 0, 0)
-  const pixels = sourceContext.getImageData(0, 0, source.width, source.height)
-  for (let index = 0; index < pixels.data.length; index += 4) {
-    const luminance = (pixels.data[index] * 0.2126 + pixels.data[index + 1] * 0.7152 + pixels.data[index + 2] * 0.0722) / 255
-    pixels.data[index] = 255
-    pixels.data[index + 1] = 255
-    pixels.data[index + 2] = 255
-    pixels.data[index + 3] = Math.round(pixels.data[index + 3] * luminance)
-  }
-  sourceContext.putImageData(pixels, 0, 0)
+function makeVectorAlphaMask(layer: Layer, width: number, height: number) {
+  const vectorMask = layer.vectorMask
+  if (!vectorMask || vectorMask.disable) return undefined
   const alpha = document.createElement('canvas')
   alpha.width = width
   alpha.height = height
-  const alphaContext = alpha.getContext('2d')
-  if (!alphaContext) return undefined
-  const position = getMaskDocumentPosition(layer)
-  alphaContext.drawImage(source, position.x, position.y)
+  const context = alpha.getContext('2d')
+  if (!context) return undefined
+  if (vectorMask.fillStartsWithAllPixels) {
+    context.fillStyle = '#fff'
+    context.fillRect(0, 0, width, height)
+  }
+
+  for (const path of vectorMask.paths) {
+    if (path.open || path.knots.length < 2) continue
+    const shape = document.createElement('canvas')
+    shape.width = width
+    shape.height = height
+    const shapeContext = shape.getContext('2d')
+    if (!shapeContext) continue
+    const first = path.knots[0]
+    shapeContext.beginPath()
+    shapeContext.moveTo(first.points[0], first.points[1])
+    for (let index = 1; index <= path.knots.length; index += 1) {
+      const previous = path.knots[index - 1]
+      const next = path.knots[index % path.knots.length]
+      shapeContext.bezierCurveTo(previous.points[4], previous.points[5], next.points[2], next.points[3], next.points[0], next.points[1])
+    }
+    shapeContext.closePath()
+    shapeContext.fillStyle = '#fff'
+    shapeContext.fill(path.fillRule === 'even-odd' ? 'evenodd' : 'nonzero')
+
+    const operation = path.operation || 'combine'
+    context.save()
+    context.globalCompositeOperation = operation === 'subtract'
+      ? 'destination-out'
+      : operation === 'intersect'
+        ? 'destination-in'
+        : operation === 'exclude'
+          ? 'xor'
+          : 'source-over'
+    context.drawImage(shape, 0, 0)
+    context.restore()
+  }
+
+  if (vectorMask.invert) {
+    const inverse = document.createElement('canvas')
+    inverse.width = width
+    inverse.height = height
+    const inverseContext = inverse.getContext('2d')
+    if (!inverseContext) return undefined
+    inverseContext.fillStyle = '#fff'
+    inverseContext.fillRect(0, 0, width, height)
+    inverseContext.globalCompositeOperation = 'destination-out'
+    inverseContext.drawImage(alpha, 0, 0)
+    return inverse
+  }
+  return alpha
+}
+
+function makeAlphaMask(layer: Layer, width: number, height: number) {
+  const mask = layerMaskCanvas(layer)
+  let alpha: HTMLCanvasElement | undefined
+  if (mask && !layer.mask?.disabled) {
+    const source = document.createElement('canvas')
+    source.width = mask.width
+    source.height = mask.height
+    const sourceContext = source.getContext('2d', { willReadFrequently: true })
+    if (sourceContext) {
+      sourceContext.drawImage(mask, 0, 0)
+      const pixels = sourceContext.getImageData(0, 0, source.width, source.height)
+      for (let index = 0; index < pixels.data.length; index += 4) {
+        const luminance = (pixels.data[index] * 0.2126 + pixels.data[index + 1] * 0.7152 + pixels.data[index + 2] * 0.0722) / 255
+        pixels.data[index] = 255
+        pixels.data[index + 1] = 255
+        pixels.data[index + 2] = 255
+        pixels.data[index + 3] = Math.round(pixels.data[index + 3] * luminance)
+      }
+      sourceContext.putImageData(pixels, 0, 0)
+      alpha = document.createElement('canvas')
+      alpha.width = width
+      alpha.height = height
+      const alphaContext = alpha.getContext('2d')
+      if (!alphaContext) return undefined
+      const position = getMaskDocumentPosition(layer)
+      alphaContext.drawImage(source, position.x, position.y)
+    }
+  }
+
+  const vectorAlpha = makeVectorAlphaMask(layer, width, height)
+  if (!alpha) return vectorAlpha
+  if (vectorAlpha) {
+    const context = alpha.getContext('2d')
+    if (context) {
+      context.globalCompositeOperation = 'destination-in'
+      context.drawImage(vectorAlpha, 0, 0)
+    }
+  }
   return alpha
 }
 
@@ -164,6 +242,11 @@ function makeLayerAlphaMask(layer: Layer, width: number, height: number) {
   const context = alpha.getContext('2d')
   if (!context) return undefined
   context.drawImage(canvas, layer.left || 0, layer.top || 0)
+  const vectorAlpha = makeVectorAlphaMask(layer, width, height)
+  if (vectorAlpha) {
+    context.globalCompositeOperation = 'destination-in'
+    context.drawImage(vectorAlpha, 0, 0)
+  }
   return alpha
 }
 
@@ -200,7 +283,7 @@ function makeLayerBoundsAlphaMask(layer: Layer, width: number, height: number) {
 
 function findClippingBase(layers: Layer[], layerIndex: number) {
   if (!layers[layerIndex]?.clipping) return undefined
-  return layers.slice(layerIndex + 1).find((layer) => !layer.clipping && (toCanvas(layer) || layer.mask?.canvas || layer.mask?.imageData || ((layer.right ?? 0) > (layer.left ?? 0) && (layer.bottom ?? 0) > (layer.top ?? 0))))
+  return layers.slice(layerIndex + 1).find((layer) => !layer.clipping && (toCanvas(layer) || layerHasMask(layer) || ((layer.right ?? 0) > (layer.left ?? 0) && (layer.bottom ?? 0) > (layer.top ?? 0))))
 }
 
 function analyzeMask(mask: HTMLCanvasElement) {
@@ -208,32 +291,16 @@ function analyzeMask(mask: HTMLCanvasElement) {
   if (!context) return undefined
   const { data, width, height } = context.getImageData(0, 0, mask.width, mask.height)
   let minX = width, minY = height, maxX = -1, maxY = -1
-  let topLeft: { x: number; y: number } | undefined
-  let topRight: { x: number; y: number } | undefined
-  let bottomRight: { x: number; y: number } | undefined
-  let bottomLeft: { x: number; y: number } | undefined
-  let minSum = Infinity, maxDifference = -Infinity, maxSum = -Infinity, minDifference = Infinity
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       if (data[(y * width + x) * 4 + 3] < 24) continue
       minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y)
-      const sum = x + y
-      const difference = x - y
-      if (sum < minSum) { minSum = sum; topLeft = { x, y } }
-      if (difference > maxDifference) { maxDifference = difference; topRight = { x, y } }
-      if (sum > maxSum) { maxSum = sum; bottomRight = { x, y } }
-      if (difference < minDifference) { minDifference = difference; bottomLeft = { x, y } }
     }
   }
 
   if (maxX < minX || maxY < minY) return undefined
-  const corners = [topLeft, topRight, bottomRight, bottomLeft]
-  const distinct = new Set(corners.filter((point): point is { x: number; y: number } => Boolean(point)).map((point) => `${point.x},${point.y}`))
-  return {
-    bounds: { left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
-    corners: distinct.size === 4 ? corners as { x: number; y: number }[] : undefined,
-  }
+  return { bounds: { left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 } }
 }
 
 function createMockupPreview(composite: HTMLCanvasElement, width: number, height: number) {
@@ -245,71 +312,6 @@ function createMockupPreview(composite: HTMLCanvasElement, width: number, height
   if (!context) throw new Error('Não foi possível preparar a pré-visualização do mockup.')
   context.drawImage(composite, 0, 0, preview.width, preview.height)
   return preview.toDataURL('image/webp', 0.84)
-}
-
-function solveLinear(matrix: number[][], values: number[]) {
-  const rows = matrix.map((row, index) => [...row, values[index]])
-  const size = values.length
-  for (let column = 0; column < size; column += 1) {
-    let pivot = column
-    for (let row = column + 1; row < size; row += 1) if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row
-    if (Math.abs(rows[pivot][column]) < 1e-10) return undefined
-    ;[rows[column], rows[pivot]] = [rows[pivot], rows[column]]
-    const divisor = rows[column][column]
-    for (let index = column; index <= size; index += 1) rows[column][index] /= divisor
-    for (let row = 0; row < size; row += 1) {
-      if (row === column) continue
-      const factor = rows[row][column]
-      for (let index = column; index <= size; index += 1) rows[row][index] -= factor * rows[column][index]
-    }
-  }
-  return rows.map((row) => row[size])
-}
-
-function getProjectiveTransform(source: { x: number; y: number }[], destination: { x: number; y: number }[]) {
-  const matrix: number[][] = []
-  const values: number[] = []
-  source.forEach(({ x, y }, index) => {
-    const { x: u, y: v } = destination[index]
-    matrix.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u)
-    matrix.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v)
-  })
-  const solved = solveLinear(matrix, values)
-  return solved ? [...solved, 1] : undefined
-}
-
-function projectPoint(transform: number[], x: number, y: number) {
-  const divisor = transform[6] * x + transform[7] * y + 1
-  return { x: (transform[0] * x + transform[1] * y + transform[2]) / divisor, y: (transform[3] * x + transform[4] * y + transform[5]) / divisor }
-}
-
-function drawPerspective(context: CanvasRenderingContext2D, source: HTMLCanvasElement, corners: { x: number; y: number }[]) {
-  const from = [{ x: 0, y: 0 }, { x: source.width, y: 0 }, { x: source.width, y: source.height }, { x: 0, y: source.height }]
-  const transform = getProjectiveTransform(from, corners)
-  if (!transform) return false
-  const divisions = 24
-  const drawTriangle = (points: { x: number; y: number }[]) => {
-    const projected = points.map(({ x, y }) => projectPoint(transform, x, y))
-    const [p1, p2, p3] = points
-    const [q1, q2, q3] = projected
-    const affineX = solveLinear([[p1.x, p1.y, 1], [p2.x, p2.y, 1], [p3.x, p3.y, 1]], [q1.x, q2.x, q3.x])
-    const affineY = solveLinear([[p1.x, p1.y, 1], [p2.x, p2.y, 1], [p3.x, p3.y, 1]], [q1.y, q2.y, q3.y])
-    if (!affineX || !affineY) return
-    context.save()
-    context.beginPath(); context.moveTo(q1.x, q1.y); context.lineTo(q2.x, q2.y); context.lineTo(q3.x, q3.y); context.closePath(); context.clip()
-    context.setTransform(affineX[0], affineY[0], affineX[1], affineY[1], affineX[2], affineY[2])
-    context.drawImage(source, 0, 0)
-    context.restore()
-  }
-  for (let row = 0; row < divisions; row += 1) {
-    for (let column = 0; column < divisions; column += 1) {
-      const left = source.width * column / divisions, right = source.width * (column + 1) / divisions
-      const top = source.height * row / divisions, bottom = source.height * (row + 1) / divisions
-      drawTriangle([{ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }])
-      drawTriangle([{ x: left, y: top }, { x: right, y: bottom }, { x: left, y: bottom }])
-    }
-  }
-  return true
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number) {
@@ -343,7 +345,7 @@ async function parseMockup(file: File, data: ArrayBuffer, savedTargetId?: string
   }
   const fileId = `${file.name}-${file.size}-${file.lastModified}`
   const targetId = savedTargetId && layers.some((layer) => layerId(layer) === savedTargetId) ? savedTargetId : findTarget(layers)
-  return { id: fileId, file, data, psd, layers, targetId, previewUrl: createMockupPreview(composite, width, height), width, height }
+  return { id: fileId, file, data, psd, layers, composite, targetId, previewUrl: createMockupPreview(composite, width, height), width, height }
 }
 
 async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, format: ExportFormat) {
@@ -370,7 +372,6 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   if (!geometry) throw new Error('Não foi possível ler a máscara da camada de destino.')
   if (!geometry.bounds) throw new Error(`A máscara da camada “${target.name || 'selecionada'}” está vazia.`)
   const bounds = geometry.bounds
-  const region = geometry.corners
 
   const output = document.createElement('canvas')
   output.width = mockup.width
@@ -384,7 +385,10 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
     const canvas = toCanvas(layer)
     if (canvas) context.drawImage(canvas, layer.left || 0, layer.top || 0)
   }
-  for (let index = mockup.layers.length - 1; index > targetIndex; index -= 1) drawLayer(mockup.layers[index])
+  if (mockup.composite) context.drawImage(mockup.composite, 0, 0)
+  else {
+    for (let index = mockup.layers.length - 1; index > targetIndex; index -= 1) drawLayer(mockup.layers[index])
+  }
 
   const bitmap = await createImageBitmap(artwork.file)
   const art = document.createElement('canvas')
@@ -395,20 +399,15 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height)
   bitmap.close()
 
-  const projectedArt = document.createElement('canvas')
-  projectedArt.width = output.width
-  projectedArt.height = output.height
-  const projectedContext = projectedArt.getContext('2d')
-  if (!projectedContext) throw new Error('Não foi possível preparar a área de projeção.')
-  let projected = false
-  if (region) {
-    const shiftedCorners = region.map(({ x, y }) => ({ x: x - bounds.left, y: y - bounds.top }))
-    projected = drawPerspective(projectedContext, art, shiftedCorners)
-  }
-  if (!projected) projectedContext.drawImage(art, bounds.left, bounds.top)
-  projectedContext.globalCompositeOperation = 'destination-in'
-  projectedContext.drawImage(alphaMask, 0, 0)
-  context.drawImage(projectedArt, 0, 0)
+  const clippedArt = document.createElement('canvas')
+  clippedArt.width = output.width
+  clippedArt.height = output.height
+  const clippedContext = clippedArt.getContext('2d')
+  if (!clippedContext) throw new Error('Não foi possível preparar a área de recorte.')
+  clippedContext.drawImage(art, bounds.left, bounds.top)
+  clippedContext.globalCompositeOperation = 'destination-in'
+  clippedContext.drawImage(alphaMask, 0, 0)
+  context.drawImage(clippedArt, 0, 0)
 
   for (let index = targetIndex - 1; index >= 0; index -= 1) drawLayer(mockup.layers[index])
   const blob = await canvasToBlob(output, format === 'png' ? 'image/png' : 'image/jpeg', format === 'jpg' ? 0.96 : undefined)
