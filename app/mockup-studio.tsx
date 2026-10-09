@@ -194,30 +194,48 @@ function findClippingBase(layers: Layer[], layerIndex: number) {
   return layers.slice(layerIndex + 1).find((layer) => !layer.clipping && (toCanvas(layer) || layer.mask?.canvas || layer.mask?.imageData || ((layer.right ?? 0) > (layer.left ?? 0) && (layer.bottom ?? 0) > (layer.top ?? 0))))
 }
 
-function maskCorners(mask: HTMLCanvasElement) {
+function analyzeMask(mask: HTMLCanvasElement) {
   const context = mask.getContext('2d', { willReadFrequently: true })
   if (!context) return undefined
   const { data, width, height } = context.getImageData(0, 0, mask.width, mask.height)
   let minX = width, minY = height, maxX = -1, maxY = -1
-  const points: { x: number; y: number }[] = []
+  let topLeft: { x: number; y: number } | undefined
+  let topRight: { x: number; y: number } | undefined
+  let bottomRight: { x: number; y: number } | undefined
+  let bottomLeft: { x: number; y: number } | undefined
+  let minSum = Infinity, maxDifference = -Infinity, maxSum = -Infinity, minDifference = Infinity
+
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const alpha = data[(y * width + x) * 4 + 3]
-      if (alpha < 24) continue
+      if (data[(y * width + x) * 4 + 3] < 24) continue
       minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y)
-      if (x % 3 === 0 && y % 3 === 0) points.push({ x, y })
+      const sum = x + y
+      const difference = x - y
+      if (sum < minSum) { minSum = sum; topLeft = { x, y } }
+      if (difference > maxDifference) { maxDifference = difference; topRight = { x, y } }
+      if (sum > maxSum) { maxSum = sum; bottomRight = { x, y } }
+      if (difference < minDifference) { minDifference = difference; bottomLeft = { x, y } }
     }
   }
-  if (maxX <= minX || maxY <= minY) return undefined
-  const extremes = [
-    points.reduce((best, point) => point.x + point.y < best.x + best.y ? point : best, points[0] || { x: minX, y: minY }),
-    points.reduce((best, point) => point.x - point.y > best.x - best.y ? point : best, points[0] || { x: maxX, y: minY }),
-    points.reduce((best, point) => point.x + point.y > best.x + best.y ? point : best, points[0] || { x: maxX, y: maxY }),
-    points.reduce((best, point) => point.x - point.y < best.x - best.y ? point : best, points[0] || { x: minX, y: maxY }),
-  ]
-  const distinct = new Set(extremes.map((point) => `${point.x},${point.y}`))
-  if (distinct.size < 4) return undefined
-  return extremes
+
+  if (maxX < minX || maxY < minY) return undefined
+  const corners = [topLeft, topRight, bottomRight, bottomLeft]
+  const distinct = new Set(corners.filter((point): point is { x: number; y: number } => Boolean(point)).map((point) => `${point.x},${point.y}`))
+  return {
+    bounds: { left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+    corners: distinct.size === 4 ? corners as { x: number; y: number }[] : undefined,
+  }
+}
+
+function createMockupPreview(composite: HTMLCanvasElement, width: number, height: number) {
+  const scale = Math.min(1, 1400 / width, 1400 / height)
+  const preview = document.createElement('canvas')
+  preview.width = Math.max(1, Math.round(width * scale))
+  preview.height = Math.max(1, Math.round(height * scale))
+  const context = preview.getContext('2d')
+  if (!context) throw new Error('Não foi possível preparar a pré-visualização do mockup.')
+  context.drawImage(composite, 0, 0, preview.width, preview.height)
+  return preview.toDataURL('image/webp', 0.84)
 }
 
 function solveLinear(matrix: number[][], values: number[]) {
@@ -299,13 +317,14 @@ function fitImage(context: CanvasRenderingContext2D, image: CanvasImageSource, i
 }
 
 async function parseMockup(file: File, data: ArrayBuffer, savedTargetId?: string): Promise<Mockup> {
-  const psd = readPsd(data, { skipCompositeImageData: false, skipLayerImageData: false })
+  const psd = readPsd(data, { skipCompositeImageData: false, skipLayerImageData: false, skipLinkedFilesData: true })
   const layers = flattenLayers(psd.children || [])
   if (!layers.length) throw new Error('Este PSD não contém camadas com imagem.')
   const width = psd.width, height = psd.height
-  const composite = getCompositeCanvas(psd) || document.createElement('canvas')
+  const mergedComposite = getCompositeCanvas(psd)
+  const composite = mergedComposite || document.createElement('canvas')
   if (!composite.width || !composite.height) { composite.width = width; composite.height = height }
-  if (!getCompositeCanvas(psd)) {
+  if (!mergedComposite) {
     const context = composite.getContext('2d')
     if (!context) throw new Error('Não foi possível criar a pré-visualização.')
     for (const layer of [...layers].reverse()) {
@@ -315,7 +334,7 @@ async function parseMockup(file: File, data: ArrayBuffer, savedTargetId?: string
   }
   const fileId = `${file.name}-${file.size}-${file.lastModified}`
   const targetId = savedTargetId && layers.some((layer) => layerId(layer) === savedTargetId) ? savedTargetId : findTarget(layers)
-  return { id: fileId, file, data, psd, layers, targetId, previewUrl: composite.toDataURL('image/png'), width, height }
+  return { id: fileId, file, data, psd, layers, targetId, previewUrl: createMockupPreview(composite, width, height), width, height }
 }
 
 async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, format: ExportFormat) {
@@ -338,19 +357,11 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   if (!alphaMask) alphaMask = makeLayerBoundsAlphaMask(target, mockup.width, mockup.height)
   if (!alphaMask) throw new Error(`A camada “${target.name || 'selecionada'}” não tem uma forma nem limites de recorte no PSD.`)
 
-  const maskContext = alphaMask.getContext('2d', { willReadFrequently: true })
-  if (!maskContext) throw new Error('Não foi possível ler a máscara da camada de destino.')
-  const maskPixels = maskContext.getImageData(0, 0, alphaMask.width, alphaMask.height).data
-  let left = mockup.width, top = mockup.height, right = -1, bottom = -1
-  for (let y = 0; y < mockup.height; y += 1) {
-    for (let x = 0; x < mockup.width; x += 1) {
-      if (maskPixels[(y * mockup.width + x) * 4 + 3] <= 24) continue
-      left = Math.min(left, x); top = Math.min(top, y); right = Math.max(right, x); bottom = Math.max(bottom, y)
-    }
-  }
-  if (right < left || bottom < top) throw new Error(`A máscara da camada “${target.name || 'selecionada'}” está vazia.`)
-  const bounds = { left, top, width: right - left + 1, height: bottom - top + 1 }
-  const region = maskCorners(alphaMask)
+  const geometry = analyzeMask(alphaMask)
+  if (!geometry) throw new Error('Não foi possível ler a máscara da camada de destino.')
+  if (!geometry.bounds) throw new Error(`A máscara da camada “${target.name || 'selecionada'}” está vazia.`)
+  const bounds = geometry.bounds
+  const region = geometry.corners
 
   const output = document.createElement('canvas')
   output.width = mockup.width
@@ -685,7 +696,7 @@ export default function MockupStudio() {
           zip.file(`${String(mockupIndex + 1).padStart(2, '0')}_${mockupName}/${String(artworkIndex + 1).padStart(2, '0')}_${artworkName}.${format}`, blob)
         }
       }
-      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 4 } })
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' })
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
