@@ -1,7 +1,7 @@
 'use client'
 
-import { useMemo, useRef, useState } from 'react'
-import { readPsd, getLayerCanvas, type Layer, type Psd } from 'ag-psd'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { readPsd, getLayerCanvas, getLayerMaskCanvas, getCompositeCanvas, type Layer, type Psd } from 'ag-psd'
 import JSZip from 'jszip'
 import {
   ArrowDownToLine,
@@ -23,6 +23,7 @@ type PsdLayer = Layer
 type Mockup = {
   id: string
   file: File
+  data: ArrayBuffer
   psd: Psd
   layers: PsdLayer[]
   targetId: string
@@ -32,9 +33,52 @@ type Mockup = {
 }
 type Artwork = { id: string; file: File; previewUrl: string }
 type ExportFormat = 'png' | 'jpg'
+type StoredMockup = { name: string; data: ArrayBuffer; targetId: string }
+type StoredProject = { id: string; name: string; updatedAt: number; mockups: StoredMockup[] }
+type ViewMode = 'single' | 'grid'
 
 const layerKeywords = /clip|mask|design|artwork|art\b|print|placeholder|insert/i
 const layerIds = new WeakMap<Layer, string>()
+const databaseName = 'atelier-mockup-studio'
+const projectStore = 'projects'
+
+function openStudioDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(databaseName, 1)
+    request.onupgradeneeded = () => request.result.createObjectStore(projectStore, { keyPath: 'id' })
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error || new Error('Não foi possível abrir a biblioteca local.'))
+  })
+}
+
+async function readStoredProjects() {
+  const database = await openStudioDatabase()
+  return new Promise<StoredProject[]>((resolve, reject) => {
+    const request = database.transaction(projectStore, 'readonly').objectStore(projectStore).getAll()
+    request.onsuccess = () => resolve((request.result as StoredProject[]).sort((a, b) => b.updatedAt - a.updatedAt))
+    request.onerror = () => reject(request.error || new Error('Não foi possível ler os projetos guardados.'))
+  })
+}
+
+async function saveStoredProject(project: StoredProject) {
+  const database = await openStudioDatabase()
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(projectStore, 'readwrite')
+    transaction.objectStore(projectStore).put(project)
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error || new Error('Não foi possível guardar este projeto.'))
+  })
+}
+
+async function deleteStoredProject(id: string) {
+  const database = await openStudioDatabase()
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(projectStore, 'readwrite')
+    transaction.objectStore(projectStore).delete(id)
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error || new Error('Não foi possível eliminar este projeto.'))
+  })
+}
 
 function layerId(layer: Layer) {
   return layerIds.get(layer) || ''
@@ -43,21 +87,154 @@ function layerId(layer: Layer) {
 function flattenLayers(layers: Layer[] = [], result: PsdLayer[] = []) {
   for (const layer of layers) {
     layerIds.set(layer, `${layer.name || 'layer'}-${result.length}-${layer.left || 0}-${layer.top || 0}`)
-    result.push(layer)
     if (layer.children?.length) flattenLayers(layer.children, result)
+    else result.push(layer)
   }
   return result
 }
 
 function findTarget(layers: PsdLayer[]) {
+  const namedMask = layers.find((layer) => layerKeywords.test(layer.name || '') && (layer.mask?.canvas || layer.mask?.imageData || layer.canvas || layer.imageData))
+  const clippedLayer = layers.find((layer) => layer.clipping && (layer.mask?.canvas || layer.mask?.imageData || layer.canvas || layer.imageData))
+  const maskedLayer = layers.find((layer) => layer.mask?.canvas || layer.mask?.imageData)
   const namedLayer = layers.find((layer) => layerKeywords.test(layer.name || ''))
-  const clippedLayer = layers.find((layer) => layer.clipping)
   const imageLayer = layers.find((layer) => layer.canvas || layer.imageData)
-  return layerId(namedLayer || clippedLayer || imageLayer || layers[0])
+  return layerId(namedMask || clippedLayer || maskedLayer || namedLayer || imageLayer || layers[0])
 }
 
 function toCanvas(layer: Layer) {
   return getLayerCanvas(layer)
+}
+
+function layerMaskCanvas(layer: Layer) {
+  return getLayerMaskCanvas(layer)
+}
+
+function getMaskDocumentPosition(layer: Layer) {
+  const mask = layer.mask
+  if (!mask) return { x: layer.left || 0, y: layer.top || 0 }
+  return mask.positionRelativeToLayer
+    ? { x: (layer.left || 0) + (mask.left || 0), y: (layer.top || 0) + (mask.top || 0) }
+    : { x: mask.left ?? layer.left ?? 0, y: mask.top ?? layer.top ?? 0 }
+}
+
+function makeAlphaMask(layer: Layer, width: number, height: number) {
+  const mask = layerMaskCanvas(layer)
+  if (!mask || layer.mask?.disabled) return undefined
+  const source = document.createElement('canvas')
+  source.width = mask.width
+  source.height = mask.height
+  const sourceContext = source.getContext('2d', { willReadFrequently: true })
+  if (!sourceContext) return undefined
+  sourceContext.drawImage(mask, 0, 0)
+  const pixels = sourceContext.getImageData(0, 0, source.width, source.height)
+  for (let index = 0; index < pixels.data.length; index += 4) {
+    const luminance = (pixels.data[index] * 0.2126 + pixels.data[index + 1] * 0.7152 + pixels.data[index + 2] * 0.0722) / 255
+    pixels.data[index] = 255
+    pixels.data[index + 1] = 255
+    pixels.data[index + 2] = 255
+    pixels.data[index + 3] = Math.round(pixels.data[index + 3] * luminance)
+  }
+  sourceContext.putImageData(pixels, 0, 0)
+  const alpha = document.createElement('canvas')
+  alpha.width = width
+  alpha.height = height
+  const alphaContext = alpha.getContext('2d')
+  if (!alphaContext) return undefined
+  const position = getMaskDocumentPosition(layer)
+  alphaContext.drawImage(source, position.x, position.y)
+  return alpha
+}
+
+function maskCorners(mask: HTMLCanvasElement) {
+  const context = mask.getContext('2d', { willReadFrequently: true })
+  if (!context) return undefined
+  const { data, width, height } = context.getImageData(0, 0, mask.width, mask.height)
+  let minX = width, minY = height, maxX = -1, maxY = -1
+  const points: { x: number; y: number }[] = []
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const alpha = data[(y * width + x) * 4 + 3]
+      if (alpha < 24) continue
+      minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y)
+      if (x % 3 === 0 && y % 3 === 0) points.push({ x, y })
+    }
+  }
+  if (maxX <= minX || maxY <= minY) return undefined
+  const extremes = [
+    points.reduce((best, point) => point.x + point.y < best.x + best.y ? point : best, points[0] || { x: minX, y: minY }),
+    points.reduce((best, point) => point.x - point.y > best.x - best.y ? point : best, points[0] || { x: maxX, y: minY }),
+    points.reduce((best, point) => point.x + point.y > best.x + best.y ? point : best, points[0] || { x: maxX, y: maxY }),
+    points.reduce((best, point) => point.x - point.y < best.x - best.y ? point : best, points[0] || { x: minX, y: maxY }),
+  ]
+  const distinct = new Set(extremes.map((point) => `${point.x},${point.y}`))
+  if (distinct.size < 4) return undefined
+  return extremes
+}
+
+function solveLinear(matrix: number[][], values: number[]) {
+  const rows = matrix.map((row, index) => [...row, values[index]])
+  const size = values.length
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column
+    for (let row = column + 1; row < size; row += 1) if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row
+    if (Math.abs(rows[pivot][column]) < 1e-10) return undefined
+    ;[rows[column], rows[pivot]] = [rows[pivot], rows[column]]
+    const divisor = rows[column][column]
+    for (let index = column; index <= size; index += 1) rows[column][index] /= divisor
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue
+      const factor = rows[row][column]
+      for (let index = column; index <= size; index += 1) rows[row][index] -= factor * rows[column][index]
+    }
+  }
+  return rows.map((row) => row[size])
+}
+
+function getProjectiveTransform(source: { x: number; y: number }[], destination: { x: number; y: number }[]) {
+  const matrix: number[][] = []
+  const values: number[] = []
+  source.forEach(({ x, y }, index) => {
+    const { x: u, y: v } = destination[index]
+    matrix.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u)
+    matrix.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v)
+  })
+  const solved = solveLinear(matrix, values)
+  return solved ? [...solved, 1] : undefined
+}
+
+function projectPoint(transform: number[], x: number, y: number) {
+  const divisor = transform[6] * x + transform[7] * y + 1
+  return { x: (transform[0] * x + transform[1] * y + transform[2]) / divisor, y: (transform[3] * x + transform[4] * y + transform[5]) / divisor }
+}
+
+function drawPerspective(context: CanvasRenderingContext2D, source: HTMLCanvasElement, corners: { x: number; y: number }[]) {
+  const from = [{ x: 0, y: 0 }, { x: source.width, y: 0 }, { x: source.width, y: source.height }, { x: 0, y: source.height }]
+  const transform = getProjectiveTransform(from, corners)
+  if (!transform) return false
+  const divisions = 24
+  const drawTriangle = (points: { x: number; y: number }[]) => {
+    const projected = points.map(({ x, y }) => projectPoint(transform, x, y))
+    const [p1, p2, p3] = points
+    const [q1, q2, q3] = projected
+    const affineX = solveLinear([[p1.x, p1.y, 1], [p2.x, p2.y, 1], [p3.x, p3.y, 1]], [q1.x, q2.x, q3.x])
+    const affineY = solveLinear([[p1.x, p1.y, 1], [p2.x, p2.y, 1], [p3.x, p3.y, 1]], [q1.y, q2.y, q3.y])
+    if (!affineX || !affineY) return
+    context.save()
+    context.beginPath(); context.moveTo(q1.x, q1.y); context.lineTo(q2.x, q2.y); context.lineTo(q3.x, q3.y); context.closePath(); context.clip()
+    context.setTransform(affineX[0], affineY[0], affineX[1], affineY[1], affineX[2], affineY[2])
+    context.drawImage(source, 0, 0)
+    context.restore()
+  }
+  for (let row = 0; row < divisions; row += 1) {
+    for (let column = 0; column < divisions; column += 1) {
+      const left = source.width * column / divisions, right = source.width * (column + 1) / divisions
+      const top = source.height * row / divisions, bottom = source.height * (row + 1) / divisions
+      drawTriangle([{ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }])
+      drawTriangle([{ x: left, y: top }, { x: right, y: bottom }, { x: left, y: bottom }])
+    }
+  }
+  return true
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number) {
@@ -73,41 +250,81 @@ function fitImage(context: CanvasRenderingContext2D, image: CanvasImageSource, i
   context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight)
 }
 
+async function parseMockup(file: File, data: ArrayBuffer, savedTargetId?: string): Promise<Mockup> {
+  const psd = readPsd(data, { skipCompositeImageData: false, skipLayerImageData: false })
+  const layers = flattenLayers(psd.children || [])
+  if (!layers.length) throw new Error('Este PSD não contém camadas com imagem.')
+  const width = psd.width, height = psd.height
+  const composite = getCompositeCanvas(psd) || document.createElement('canvas')
+  if (!composite.width || !composite.height) { composite.width = width; composite.height = height }
+  if (!getCompositeCanvas(psd)) {
+    const context = composite.getContext('2d')
+    if (!context) throw new Error('Não foi possível criar a pré-visualização.')
+    for (const layer of [...layers].reverse()) {
+      const canvas = toCanvas(layer)
+      if (canvas && !layer.hidden) context.drawImage(canvas, layer.left || 0, layer.top || 0)
+    }
+  }
+  const fileId = `${file.name}-${file.size}-${file.lastModified}`
+  const targetId = savedTargetId && layers.some((layer) => layerId(layer) === savedTargetId) ? savedTargetId : findTarget(layers)
+  return { id: fileId, file, data, psd, layers, targetId, previewUrl: composite.toDataURL('image/png'), width, height }
+}
+
 async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, format: ExportFormat) {
-  const target = mockup.layers.find((layer) => layerId(layer) === targetId)
-  const targetCanvas = target ? toCanvas(target) : undefined
-  if (!target || !targetCanvas) throw new Error(`A camada selecionada não tem imagem rasterizada: ${target?.name || 'camada'}`)
+  const targetIndex = mockup.layers.findIndex((layer) => layerId(layer) === targetId)
+  const target = mockup.layers[targetIndex]
+  if (!target) throw new Error('Escolhe uma camada de destino válida.')
+  const alphaMask = makeAlphaMask(target, mockup.width, mockup.height)
+  const targetCanvas = toCanvas(target)
+  if (!alphaMask && !targetCanvas) throw new Error(`A camada “${target.name || 'selecionada'}” não tem uma máscara rasterizada. No PSD, adiciona uma máscara de camada à camada de destino.`)
 
   const output = document.createElement('canvas')
   output.width = mockup.width
   output.height = mockup.height
   const context = output.getContext('2d')
   if (!context) throw new Error('Este browser não suporta composição em canvas.')
+  if (format === 'jpg') { context.fillStyle = '#ffffff'; context.fillRect(0, 0, output.width, output.height) }
 
-  if (format === 'jpg') {
-    context.fillStyle = '#ffffff'
-    context.fillRect(0, 0, output.width, output.height)
-  }
-
-  for (const layer of [...mockup.layers].reverse()) {
-    if (layerId(layer) === targetId || layer.hidden) continue
+  const drawLayer = (layer: Layer) => {
+    if (layer.hidden) return
     const canvas = toCanvas(layer)
-    if (!canvas) continue
-    context.drawImage(canvas, layer.left || 0, layer.top || 0)
+    if (canvas) context.drawImage(canvas, layer.left || 0, layer.top || 0)
   }
+  for (let index = mockup.layers.length - 1; index > targetIndex; index -= 1) drawLayer(mockup.layers[index])
 
-  const artworkBitmap = await createImageBitmap(artwork.file)
-  const artLayer = document.createElement('canvas')
-  artLayer.width = targetCanvas.width
-  artLayer.height = targetCanvas.height
-  const artContext = artLayer.getContext('2d')
-  if (!artContext) throw new Error('Não foi possível preparar a ilustração.')
-  fitImage(artContext, artworkBitmap, artworkBitmap.width, artworkBitmap.height, 0, 0, artLayer.width, artLayer.height)
-  artContext.globalCompositeOperation = 'destination-in'
-  artContext.drawImage(targetCanvas, 0, 0)
-  artworkBitmap.close()
+  const bitmap = await createImageBitmap(artwork.file)
+  const region = alphaMask ? maskCorners(alphaMask) : undefined
+  const bounds = alphaMask ? (() => {
+    const ctx = alphaMask.getContext('2d', { willReadFrequently: true })!
+    const data = ctx.getImageData(0, 0, alphaMask.width, alphaMask.height).data
+    let left = output.width, top = output.height, right = -1, bottom = -1
+    for (let y = 0; y < output.height; y += 1) for (let x = 0; x < output.width; x += 1) if (data[(y * output.width + x) * 4 + 3] > 24) { left = Math.min(left, x); top = Math.min(top, y); right = Math.max(right, x); bottom = Math.max(bottom, y) }
+    return right > left && bottom > top ? { left, top, width: right - left + 1, height: bottom - top + 1 } : undefined
+  })() : undefined
+  const layerLeft = target.left || 0, layerTop = target.top || 0
+  const targetBounds = bounds || { left: layerLeft, top: layerTop, width: targetCanvas?.width || (target.right || 0) - layerLeft, height: targetCanvas?.height || (target.bottom || 0) - layerTop }
+  if (!targetBounds.width || !targetBounds.height) { bitmap.close(); throw new Error(`Não foi possível determinar a área de máscara da camada “${target.name || 'selecionada'}”.`) }
+  const art = document.createElement('canvas')
+  art.width = Math.max(1, Math.round(targetBounds.width)); art.height = Math.max(1, Math.round(targetBounds.height))
+  const artContext = art.getContext('2d')
+  if (!artContext) { bitmap.close(); throw new Error('Não foi possível preparar a ilustração.') }
+  fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height)
+  bitmap.close()
 
-  context.drawImage(artLayer, target.left || 0, target.top || 0)
+  const projectedArt = document.createElement('canvas')
+  projectedArt.width = output.width; projectedArt.height = output.height
+  const projectedContext = projectedArt.getContext('2d')
+  if (!projectedContext) throw new Error('Não foi possível preparar a área de projeção.')
+  let projected = false
+  if (region) {
+    const shiftedCorners = region.map(({ x, y }) => ({ x: x - targetBounds.left, y: y - targetBounds.top }))
+    projected = drawPerspective(projectedContext, art, shiftedCorners)
+  }
+  if (!projected) projectedContext.drawImage(art, targetBounds.left, targetBounds.top)
+  if (alphaMask) { projectedContext.globalCompositeOperation = 'destination-in'; projectedContext.drawImage(alphaMask, 0, 0) }
+  context.drawImage(projectedArt, 0, 0)
+
+  for (let index = targetIndex - 1; index >= 0; index -= 1) drawLayer(mockup.layers[index])
   const blob = await canvasToBlob(output, format === 'png' ? 'image/png' : 'image/jpeg', format === 'jpg' ? 0.96 : undefined)
   return { blob, width: output.width, height: output.height }
 }
@@ -147,7 +364,20 @@ function Dropzone({
   )
 }
 
-function PreviewStage({ mockup, artwork, targetId }: { mockup?: Mockup; artwork?: Artwork; targetId?: string }) {
+function PreviewStage({ mockup, artwork, targetId, allMockups, viewMode, onSelectMockup, onPreviewError }: { mockup?: Mockup; artwork?: Artwork; targetId?: string; allMockups: Mockup[]; viewMode: ViewMode; onSelectMockup: (id: string) => void; onPreviewError: (error: string) => void }) {
+  const [renderedUrl, setRenderedUrl] = useState('')
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl = ''
+    if (!mockup || !artwork || !targetId) { setRenderedUrl(mockup?.previewUrl || ''); return }
+    renderMockup(mockup, artwork, targetId, 'png').then(({ blob }) => {
+      if (cancelled) return
+      objectUrl = URL.createObjectURL(blob)
+      setRenderedUrl(objectUrl)
+    }).catch((error) => { if (!cancelled) onPreviewError(error instanceof Error ? error.message : 'Não foi possível criar a pré-visualização.') })
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [mockup, artwork, targetId, onPreviewError])
+
   if (!mockup) {
     return (
       <div className="preview-empty">
@@ -167,29 +397,15 @@ function PreviewStage({ mockup, artwork, targetId }: { mockup?: Mockup; artwork?
       </div>
     )
   }
-  const selectedLayer = mockup.layers.find((layer) => layerId(layer) === targetId)
-  const selectedMask = selectedLayer ? toCanvas(selectedLayer) : undefined
-  const maskImage = selectedMask ? `url("${selectedMask.toDataURL('image/png')}")` : undefined
+
+  if (viewMode === 'grid') {
+    return <div className="preview-gallery">{allMockups.map((item) => <button className={`gallery-card${item.id === mockup.id ? ' gallery-card-selected' : ''}`} key={item.id} type="button" onClick={() => onSelectMockup(item.id)}><span className="gallery-image"><img src={item.id === mockup.id && renderedUrl ? renderedUrl : item.previewUrl} alt={`Pré-visualização de ${item.file.name}`} /></span><span className="gallery-card-name">{item.file.name.replace(/\.psd$/i, '')}</span><span className="gallery-card-meta">{item.width} × {item.height} px</span></button>)}</div>
+  }
+
   return (
     <div className="preview-active">
-      <div className="preview-image-wrap">
-        <img src={mockup.previewUrl} alt={`Pré-visualização de ${mockup.file.name}`} />
-        {artwork && selectedLayer && (
-          <div className="preview-artwork-overlay" style={{
-            left: `${((selectedLayer.left || 0) / mockup.width) * 100}%`,
-            top: `${((selectedLayer.top || 0) / mockup.height) * 100}%`,
-            width: `${((selectedMask?.width || (selectedLayer.right || 0) - (selectedLayer.left || 0)) / mockup.width) * 100}%`,
-            height: `${((selectedMask?.height || (selectedLayer.bottom || 0) - (selectedLayer.top || 0)) / mockup.height) * 100}%`,
-            maskImage,
-            WebkitMaskImage: maskImage,
-            maskSize: '100% 100%',
-            WebkitMaskSize: '100% 100%',
-          }}>
-            <img src={artwork.previewUrl} alt="Ilustração selecionada" />
-          </div>
-        )}
-      </div>
-      <div className="preview-caption"><span><strong>{mockup.file.name}</strong><small>{mockup.width} × {mockup.height} px</small></span><span className="preview-ready"><Check size={13} /> {artwork ? 'Pré-visualização' : 'Mockup carregado'}</span></div>
+      <div className="preview-image-wrap"><img src={renderedUrl || mockup.previewUrl} alt={`Pré-visualização de ${mockup.file.name}${artwork ? ` com ${artwork.file.name}` : ''}`} /></div>
+      <div className="preview-caption"><span><strong>{mockup.file.name}</strong><small>{mockup.width} × {mockup.height} px</small></span><span className="preview-ready"><Check size={13} /> {artwork ? 'Pré-visualização atualizada' : 'Mockup carregado'}</span></div>
     </div>
   )
 }
@@ -197,19 +413,125 @@ function PreviewStage({ mockup, artwork, targetId }: { mockup?: Mockup; artwork?
 export default function MockupStudio() {
   const [mockups, setMockups] = useState<Mockup[]>([])
   const [artworks, setArtworks] = useState<Artwork[]>([])
+  const [projects, setProjects] = useState<StoredProject[]>([])
+  const [activeProjectId, setActiveProjectId] = useState<string>()
   const [selectedMockupId, setSelectedMockupId] = useState<string>()
   const [selectedArtworkId, setSelectedArtworkId] = useState<string>()
   const [format, setFormat] = useState<ExportFormat>('png')
   const [automatic, setAutomatic] = useState(true)
+  const [viewMode, setViewMode] = useState<ViewMode>('single')
   const [busy, setBusy] = useState(false)
+  const [databaseReady, setDatabaseReady] = useState(false)
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false)
+  const [newProjectName, setNewProjectName] = useState('')
   const [message, setMessage] = useState('')
 
+  const activeProject = projects.find((project) => project.id === activeProjectId)
   const selectedMockup = mockups.find((item) => item.id === selectedMockupId) || mockups[0]
   const selectedArtwork = artworks.find((item) => item.id === selectedArtworkId) || artworks[0]
   const readyCount = mockups.filter((item) => item.layers.some((layer) => layerId(layer) === item.targetId)).length
   const exportCount = mockups.length * artworks.length
   const targetLayer = selectedMockup?.layers.find((layer) => layerId(layer) === selectedMockup.targetId)
   const artworkLabel = useMemo(() => artworks.length === 1 ? '1 ilustração' : `${artworks.length} ilustrações`, [artworks.length])
+  const handlePreviewError = useCallback((error: string) => setMessage(error), [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function restoreProjects() {
+      try {
+        let stored = await readStoredProjects()
+        if (!stored.length) {
+          const initial: StoredProject = { id: `project-${Date.now()}`, name: 'Art prints', updatedAt: Date.now(), mockups: [] }
+          await saveStoredProject(initial)
+          stored = [initial]
+        }
+        const project = stored[0]
+        const restored = await Promise.all(project.mockups.map(async (entry) => parseMockup(new File([entry.data], entry.name, { type: 'image/vnd.adobe.photoshop' }), entry.data, entry.targetId).catch(() => undefined)))
+        if (cancelled) return
+        setProjects(stored)
+        setActiveProjectId(project.id)
+        setMockups(restored.filter((item): item is Mockup => Boolean(item)))
+        setSelectedMockupId(restored.find((item) => item)?.id)
+      } catch (error) {
+        if (!cancelled) setMessage(error instanceof Error ? error.message : 'Não foi possível abrir os projetos guardados neste browser.')
+      } finally {
+        if (!cancelled) setDatabaseReady(true)
+      }
+    }
+    restoreProjects()
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    if (!databaseReady || !activeProjectId) return
+    const project = projects.find((item) => item.id === activeProjectId)
+    if (!project) return
+    const record: StoredProject = {
+      ...project,
+      updatedAt: Date.now(),
+      mockups: mockups.map(({ file, data, targetId }) => ({ name: file.name, data, targetId })),
+    }
+    const timeout = window.setTimeout(() => {
+      saveStoredProject(record).then(() => setProjects((current) => current.map((item) => item.id === record.id ? { ...item, updatedAt: record.updatedAt } : item))).catch((error) => setMessage(error instanceof Error ? error.message : 'Não foi possível guardar a coleção localmente.'))
+    }, 400)
+    return () => window.clearTimeout(timeout)
+  }, [mockups, activeProjectId, databaseReady, activeProject?.name])
+
+  async function switchProject(id: string) {
+    const project = projects.find((item) => item.id === id)
+    if (!project || project.id === activeProjectId || busy) return
+    setBusy(true)
+    setDatabaseReady(false)
+    setMessage('')
+    artworks.forEach((artwork) => URL.revokeObjectURL(artwork.previewUrl))
+    setArtworks([]); setSelectedArtworkId(undefined)
+    try {
+      const restored = await Promise.all(project.mockups.map(async (entry) => parseMockup(new File([entry.data], entry.name, { type: 'image/vnd.adobe.photoshop' }), entry.data, entry.targetId).catch(() => undefined)))
+      setMockups(restored.filter((item): item is Mockup => Boolean(item)))
+      setSelectedMockupId(restored.find((item) => item)?.id)
+      setActiveProjectId(project.id)
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Não foi possível abrir este projeto.')
+    } finally {
+      setBusy(false)
+      setDatabaseReady(true)
+    }
+  }
+
+  async function createProject() {
+    const name = newProjectName.trim()
+    if (!name) return
+    const project: StoredProject = { id: `project-${Date.now()}-${Math.random().toString(36).slice(2)}`, name, updatedAt: Date.now(), mockups: [] }
+    try {
+      await saveStoredProject(project)
+      setProjects((current) => [project, ...current])
+      artworks.forEach((artwork) => URL.revokeObjectURL(artwork.previewUrl))
+      setArtworks([]); setSelectedArtworkId(undefined); setMockups([]); setSelectedMockupId(undefined)
+      setActiveProjectId(project.id); setNewProjectName(''); setProjectDialogOpen(false); setMessage('')
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Não foi possível criar este projeto.')
+    }
+  }
+
+  async function removeActiveProject() {
+    if (!activeProject || projects.length < 2 || busy) return
+    const remaining = projects.filter((item) => item.id !== activeProject.id)
+    try {
+      await deleteStoredProject(activeProject.id)
+      setProjects(remaining)
+      const next = remaining[0]
+      setDatabaseReady(false)
+      artworks.forEach((artwork) => URL.revokeObjectURL(artwork.previewUrl))
+      setArtworks([]); setSelectedArtworkId(undefined)
+      const restored = await Promise.all(next.mockups.map(async (entry) => parseMockup(new File([entry.data], entry.name, { type: 'image/vnd.adobe.photoshop' }), entry.data, entry.targetId).catch(() => undefined)))
+      setMockups(restored.filter((item): item is Mockup => Boolean(item)))
+      setSelectedMockupId(restored.find((item) => item)?.id)
+      setActiveProjectId(next.id); setDatabaseReady(true)
+    } catch (error) {
+      setDatabaseReady(true)
+      setMessage(error instanceof Error ? error.message : 'Não foi possível eliminar este projeto.')
+    }
+  }
 
   async function addMockupFiles(files: FileList | null) {
     if (!files?.length) return
@@ -222,23 +544,10 @@ export default function MockupStudio() {
         continue
       }
       try {
-        const psd = readPsd(await file.arrayBuffer())
-        const layers = flattenLayers(psd.children || []).filter((layer) => !layer.children?.length)
-        if (!layers.length) throw new Error('Este PSD não contém camadas com imagem.')
-        const width = psd.width
-        const height = psd.height
-        const composite = document.createElement('canvas')
-        composite.width = width
-        composite.height = height
-        const context = composite.getContext('2d')
-        if (!context) throw new Error('Não foi possível criar a pré-visualização.')
-        for (const layer of [...layers].reverse()) {
-          const canvas = toCanvas(layer)
-          if (canvas && !layer.hidden) context.drawImage(canvas, layer.left || 0, layer.top || 0)
-        }
-        const previewUrl = composite.toDataURL('image/png')
-        const targetId = automatic ? findTarget(layers) : (layers[0] ? layerId(layers[0]) : '')
-        next.push({ id: `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2)}`, file, psd, layers, targetId, previewUrl, width, height })
+        const data = await file.arrayBuffer()
+        const parsed = await parseMockup(file, data)
+        if (!automatic) parsed.targetId = parsed.layers[0] ? layerId(parsed.layers[0]) : ''
+        next.push(parsed)
       } catch (error) {
         const reason = error instanceof Error ? error.message : 'Não foi possível ler este ficheiro.'
         setMessage(`${file.name}: ${reason}`)
@@ -352,8 +661,8 @@ export default function MockupStudio() {
 
         <section className="main-panel" id="inicio">
           <div className="page-heading">
-            <div><div className="eyebrow"><span>WORKSPACE</span><span className="eyebrow-slash">/</span><span>MOCKUP STUDIO</span></div><h1>Mockup studio<span>.</span></h1><p>As tuas ilustrações, no lugar certo.</p></div>
-            <div className="page-actions"><span className="collection-status"><span />{mockups.length ? `${mockups.length} mockup${mockups.length === 1 ? '' : 's'} na coleção` : 'A tua coleção está pronta'}</span><button type="button" className="button button-secondary" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}><Plus size={16} /> Adicionar PSD</button></div>
+            <div><div className="eyebrow"><span>WORKSPACE</span><span className="eyebrow-slash">/</span><span>{activeProject?.name || 'MOCKUP STUDIO'}</span></div><h1>Mockup studio<span>.</span></h1><p>As tuas ilustrações, no lugar certo.</p></div>
+            <div className="page-actions"><div className="project-switcher"><span>PROJETO</span><select aria-label="Projeto ativo" value={activeProjectId || ''} onChange={(event) => switchProject(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button type="button" aria-label="Criar projeto" title="Criar projeto" onClick={() => setProjectDialogOpen(true)}><Plus size={15} /></button><button type="button" aria-label="Eliminar projeto atual" title={projects.length > 1 ? 'Eliminar projeto atual' : 'Cria outro projeto antes de eliminar este'} disabled={projects.length < 2 || busy} onClick={removeActiveProject}><X size={14} /></button></div><span className="collection-status"><span />{mockups.length ? `${mockups.length} mockup${mockups.length === 1 ? '' : 's'} na coleção` : 'Coleção guardada localmente'}</span><button type="button" className="button button-secondary" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}><Plus size={16} /> Adicionar PSD</button></div>
           </div>
 
           <div className="stepper" aria-label="Etapas de trabalho">
@@ -364,8 +673,8 @@ export default function MockupStudio() {
 
           <div className="work-area">
             <div className="preview-column">
-              <div className="section-heading"><div><span className="section-kicker">01 — PRÉ-VISUALIZAÇÃO</span><h2>Vista geral</h2></div><button className="view-control" type="button" aria-label="Pré-visualização do mockup"><ScanLine size={16} /><span>Enquadrar</span></button></div>
-              <div className="preview-card"><PreviewStage mockup={selectedMockup} artwork={selectedArtwork} targetId={selectedMockup?.targetId} /></div>
+              <div className="section-heading"><div><span className="section-kicker">01 — PRÉ-VISUALIZAÇÃO</span><h2>{viewMode === 'single' ? 'Mockup individual' : 'Toda a coleção'}</h2></div><div className="view-toggle" role="group" aria-label="Modo de visualização"><button type="button" aria-pressed={viewMode === 'single'} className={viewMode === 'single' ? 'view-toggle-active' : ''} onClick={() => setViewMode('single')}>Individual</button><button type="button" aria-pressed={viewMode === 'grid'} className={viewMode === 'grid' ? 'view-toggle-active' : ''} onClick={() => setViewMode('grid')}>Ver grupo</button></div></div>
+              <div className={`preview-card${viewMode === 'grid' ? ' preview-card-gallery' : ''}`}><PreviewStage mockup={selectedMockup} artwork={selectedArtwork} targetId={selectedMockup?.targetId} allMockups={mockups} viewMode={viewMode} onSelectMockup={setSelectedMockupId} onPreviewError={handlePreviewError} /></div>
               {message && <div className={`status-message${message.includes('exportados') ? ' success-message' : ''}`} role="status">{message}</div>}
               <div className="collection-strip"><div className="strip-heading"><div><span className="section-kicker">A TUA COLEÇÃO</span><h3>Mockups <span>{mockups.length.toString().padStart(2, '0')}</span></h3></div><button type="button" className="text-button" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}>Ver todos <ChevronDown size={14} /></button></div>
                 {mockups.length ? <div className="collection-grid">{mockups.map((mockup) => <div key={mockup.id} className={`collection-card${selectedMockup?.id === mockup.id ? ' collection-card-active' : ''}`} role="button" tabIndex={0} onClick={() => setSelectedMockupId(mockup.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedMockupId(mockup.id) }}><span className="collection-thumb"><img src={mockup.previewUrl} alt="" /><span className="file-type">PSD</span><button type="button" className="remove-item" aria-label={`Remover ${mockup.file.name}`} onClick={(event) => { event.stopPropagation(); removeMockup(mockup.id) }} onKeyDown={(event) => event.stopPropagation()}><X size={13} /></button></span><span className="collection-name">{mockup.file.name.replace(/\.psd$/i, '')}</span><span className="collection-meta">{mockup.width} × {mockup.height} px</span></div>)}<Dropzone title="Adicionar" subtitle="" accept=".psd,image/vnd.adobe.photoshop" multiple onFiles={addMockupFiles} compact /></div> : <div className="collection-empty"><div className="collection-empty-icon"><FileImage size={18} /></div><span><strong>Ainda sem mockups</strong><small>Adiciona um ficheiro PSD para começar a coleção.</small></span><button type="button" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}>Escolher ficheiros <Plus size={14} /></button></div>}
@@ -393,12 +702,13 @@ export default function MockupStudio() {
                   <p className="export-note">Alta resolução · um ZIP organizado por mockup</p>
                 </div>
               </div>
-              <div className="privacy-note"><span><Check size={14} /></span><p><strong>As tuas imagens ficam contigo.</strong> Todo o processamento acontece localmente no teu dispositivo.</p></div>
+              <div className="privacy-note"><span><Check size={14} /></span><p><strong>Mockups guardados neste browser.</strong> As ilustrações são temporárias e não ficam guardadas.</p></div>
             </aside>
           </div>
           <footer className="workspace-footer"><span>atelier<span className="footer-dot">.</span> <span className="footer-version">MOCKUP STUDIO</span></span><span>{mockups.length} PSD <i /> {artworks.length} imagens prontas</span></footer>
         </section>
       </div>
+      {projectDialogOpen && <div className="project-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProjectDialogOpen(false) }}><section className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title"><button type="button" className="dialog-close" aria-label="Fechar" onClick={() => setProjectDialogOpen(false)}><X size={16} /></button><span className="dialog-eyebrow">NOVA COLEÇÃO</span><h2 id="new-project-title">Criar projeto</h2><p>Organiza os teus mockups por produto, campanha ou coleção.</p><form onSubmit={(event) => { event.preventDefault(); void createProject() }}><label htmlFor="project-name">Nome do projeto</label><input id="project-name" autoFocus maxLength={50} placeholder="Ex.: T-shirts" value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} /><div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setProjectDialogOpen(false)}>Cancelar</button><button type="submit" className="button button-primary" disabled={!newProjectName.trim()}>Criar projeto</button></div></form></section></div>}
       {busy && <div className="loading-overlay" aria-live="polite"><LoaderCircle className="spin" size={22} /><span>A processar ficheiros no browser…</span></div>}
     </main>
   )
