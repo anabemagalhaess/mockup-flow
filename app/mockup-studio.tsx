@@ -709,7 +709,7 @@ function PreviewStage({ mockup, artwork, targetId, allMockups, viewMode, onSelec
   }
 
   if (viewMode === 'grid') {
-    return <div className="preview-gallery">{allMockups.map((item) => <button className={`gallery-card${item.id === mockup.id ? ' gallery-card-selected' : ''}`} key={item.id} type="button" onClick={() => onSelectMockup(item.id)}><span className="gallery-image"><img src={item.id === mockup.id && renderedUrl ? renderedUrl : item.previewUrl} alt={`Pré-visualização de ${item.file.name}`} /></span><span className="gallery-card-name">{item.file.name.replace(/\.psd$/i, '')}</span><span className="gallery-card-meta">{item.width} × {item.height} px</span></button>)}</div>
+    return <div className="preview-gallery">{allMockups.map((item) => <button className={`gallery-card${item.id === mockup.id ? ' gallery-card-selected' : ''}`} key={item.id} type="button" onClick={() => onSelectMockup(item.id)}><span className="gallery-image"><img src={item.id === mockup.id && renderedUrl ? renderedUrl : item.previewUrl} alt={`Pré-visualização de ${item.file.name}`} /></span><span className="gallery-card-details"><span className="gallery-card-name">{item.file.name.replace(/\.psd$/i, '')}</span><span className="gallery-card-meta">{item.width} × {item.height} px</span></span></button>)}</div>
   }
 
   return (
