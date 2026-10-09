@@ -332,7 +332,7 @@ async function parseMockup(file: File, data: ArrayBuffer, savedTargetId?: string
   const layers = flattenLayers(psd.children || [])
   if (!layers.length) throw new Error('Este PSD não contém camadas com imagem.')
   const width = psd.width, height = psd.height
-  const mergedComposite = getCompositeCanvas(psd)
+  const mergedComposite = psd.canvas || getCompositeCanvas(psd)
   const composite = mergedComposite || document.createElement('canvas')
   if (!composite.width || !composite.height) { composite.width = width; composite.height = height }
   if (!mergedComposite) {
