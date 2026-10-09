@@ -108,12 +108,12 @@ function layerHasMask(layer: Layer) {
 }
 
 function findTarget(layers: PsdLayer[]) {
-  const namedMask = layers.find((layer) => layerKeywords.test(layer.name || '') && (layerHasMask(layer) || layer.canvas || layer.imageData))
   const clippedLayer = layers.find((layer) => layer.clipping && (layerHasMask(layer) || layer.canvas || layer.imageData))
+  const namedMask = layers.find((layer) => layerKeywords.test(layer.name || '') && (layerHasMask(layer) || layer.canvas || layer.imageData))
   const maskedLayer = layers.find(layerHasMask)
   const namedLayer = layers.find((layer) => layerKeywords.test(layer.name || ''))
   const imageLayer = layers.find((layer) => layer.canvas || layer.imageData)
-  return layerId(namedMask || clippedLayer || maskedLayer || namedLayer || imageLayer || layers[0])
+  return layerId(clippedLayer || namedMask || maskedLayer || namedLayer || imageLayer || layers[0])
 }
 
 function toCanvas(layer: Layer) {
@@ -577,7 +577,10 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   if (!target) throw new Error('Escolhe uma camada de destino válida.')
 
   const clippingBase = findClippingBase(mockup.layers, targetIndex)
-  let alphaMask = makeAlphaMask(target, mockup.width, mockup.height) || makeLayerAlphaMask(target, mockup.width, mockup.height)
+  const clippingBaseMask = target.clipping && clippingBase
+    ? makeAlphaMask(clippingBase, mockup.width, mockup.height) || makeLayerAlphaMask(clippingBase, mockup.width, mockup.height)
+    : undefined
+  let alphaMask = clippingBaseMask || makeAlphaMask(target, mockup.width, mockup.height) || makeLayerAlphaMask(target, mockup.width, mockup.height)
   let replacedLayer: Layer | undefined
   if (!alphaMask && clippingBase) {
     alphaMask = makeAlphaMask(clippingBase, mockup.width, mockup.height) || makeLayerAlphaMask(clippingBase, mockup.width, mockup.height)
