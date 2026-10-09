@@ -146,6 +146,54 @@ function makeAlphaMask(layer: Layer, width: number, height: number) {
   return alpha
 }
 
+function makeLayerAlphaMask(layer: Layer, width: number, height: number) {
+  const canvas = toCanvas(layer)
+  if (!canvas) return undefined
+  const alpha = document.createElement('canvas')
+  alpha.width = width
+  alpha.height = height
+  const context = alpha.getContext('2d')
+  if (!context) return undefined
+  context.drawImage(canvas, layer.left || 0, layer.top || 0)
+  return alpha
+}
+
+function makeMaskBoundsAlphaMask(layer: Layer, width: number, height: number) {
+  const mask = layer.mask
+  if (!mask || mask.disabled) return undefined
+  const maskWidth = (mask.right ?? 0) - (mask.left ?? 0)
+  const maskHeight = (mask.bottom ?? 0) - (mask.top ?? 0)
+  if (maskWidth <= 0 || maskHeight <= 0) return undefined
+  const alpha = document.createElement('canvas')
+  alpha.width = width
+  alpha.height = height
+  const context = alpha.getContext('2d')
+  if (!context) return undefined
+  const position = getMaskDocumentPosition(layer)
+  context.fillStyle = '#fff'
+  context.fillRect(position.x, position.y, maskWidth, maskHeight)
+  return alpha
+}
+
+function makeLayerBoundsAlphaMask(layer: Layer, width: number, height: number) {
+  const layerWidth = (layer.right ?? 0) - (layer.left ?? 0)
+  const layerHeight = (layer.bottom ?? 0) - (layer.top ?? 0)
+  if (layerWidth <= 0 || layerHeight <= 0) return undefined
+  const alpha = document.createElement('canvas')
+  alpha.width = width
+  alpha.height = height
+  const context = alpha.getContext('2d')
+  if (!context) return undefined
+  context.fillStyle = '#fff'
+  context.fillRect(layer.left ?? 0, layer.top ?? 0, layerWidth, layerHeight)
+  return alpha
+}
+
+function findClippingBase(layers: Layer[], layerIndex: number) {
+  if (!layers[layerIndex]?.clipping) return undefined
+  return layers.slice(layerIndex + 1).find((layer) => !layer.clipping && (toCanvas(layer) || layer.mask?.canvas || layer.mask?.imageData || ((layer.right ?? 0) > (layer.left ?? 0) && (layer.bottom ?? 0) > (layer.top ?? 0))))
+}
+
 function maskCorners(mask: HTMLCanvasElement) {
   const context = mask.getContext('2d', { willReadFrequently: true })
   if (!context) return undefined
@@ -274,9 +322,35 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   const targetIndex = mockup.layers.findIndex((layer) => layerId(layer) === targetId)
   const target = mockup.layers[targetIndex]
   if (!target) throw new Error('Escolhe uma camada de destino válida.')
-  const alphaMask = makeAlphaMask(target, mockup.width, mockup.height)
-  const targetCanvas = toCanvas(target)
-  if (!alphaMask && !targetCanvas) throw new Error(`A camada “${target.name || 'selecionada'}” não tem uma máscara rasterizada. No PSD, adiciona uma máscara de camada à camada de destino.`)
+
+  const clippingBase = findClippingBase(mockup.layers, targetIndex)
+  let alphaMask = makeAlphaMask(target, mockup.width, mockup.height) || makeLayerAlphaMask(target, mockup.width, mockup.height)
+  let replacedLayer: Layer | undefined
+  if (!alphaMask && clippingBase) {
+    alphaMask = makeAlphaMask(clippingBase, mockup.width, mockup.height) || makeLayerAlphaMask(clippingBase, mockup.width, mockup.height)
+    if (alphaMask) replacedLayer = clippingBase
+  }
+  if (!alphaMask) alphaMask = makeMaskBoundsAlphaMask(target, mockup.width, mockup.height)
+  if (!alphaMask && clippingBase) {
+    alphaMask = makeMaskBoundsAlphaMask(clippingBase, mockup.width, mockup.height) || makeLayerBoundsAlphaMask(clippingBase, mockup.width, mockup.height)
+    if (alphaMask) replacedLayer = clippingBase
+  }
+  if (!alphaMask) alphaMask = makeLayerBoundsAlphaMask(target, mockup.width, mockup.height)
+  if (!alphaMask) throw new Error(`A camada “${target.name || 'selecionada'}” não tem uma forma nem limites de recorte no PSD.`)
+
+  const maskContext = alphaMask.getContext('2d', { willReadFrequently: true })
+  if (!maskContext) throw new Error('Não foi possível ler a máscara da camada de destino.')
+  const maskPixels = maskContext.getImageData(0, 0, alphaMask.width, alphaMask.height).data
+  let left = mockup.width, top = mockup.height, right = -1, bottom = -1
+  for (let y = 0; y < mockup.height; y += 1) {
+    for (let x = 0; x < mockup.width; x += 1) {
+      if (maskPixels[(y * mockup.width + x) * 4 + 3] <= 24) continue
+      left = Math.min(left, x); top = Math.min(top, y); right = Math.max(right, x); bottom = Math.max(bottom, y)
+    }
+  }
+  if (right < left || bottom < top) throw new Error(`A máscara da camada “${target.name || 'selecionada'}” está vazia.`)
+  const bounds = { left, top, width: right - left + 1, height: bottom - top + 1 }
+  const region = maskCorners(alphaMask)
 
   const output = document.createElement('canvas')
   output.width = mockup.width
@@ -286,42 +360,34 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   if (format === 'jpg') { context.fillStyle = '#ffffff'; context.fillRect(0, 0, output.width, output.height) }
 
   const drawLayer = (layer: Layer) => {
-    if (layer.hidden) return
+    if (layer.hidden || layer === replacedLayer) return
     const canvas = toCanvas(layer)
     if (canvas) context.drawImage(canvas, layer.left || 0, layer.top || 0)
   }
   for (let index = mockup.layers.length - 1; index > targetIndex; index -= 1) drawLayer(mockup.layers[index])
 
   const bitmap = await createImageBitmap(artwork.file)
-  const region = alphaMask ? maskCorners(alphaMask) : undefined
-  const bounds = alphaMask ? (() => {
-    const ctx = alphaMask.getContext('2d', { willReadFrequently: true })!
-    const data = ctx.getImageData(0, 0, alphaMask.width, alphaMask.height).data
-    let left = output.width, top = output.height, right = -1, bottom = -1
-    for (let y = 0; y < output.height; y += 1) for (let x = 0; x < output.width; x += 1) if (data[(y * output.width + x) * 4 + 3] > 24) { left = Math.min(left, x); top = Math.min(top, y); right = Math.max(right, x); bottom = Math.max(bottom, y) }
-    return right > left && bottom > top ? { left, top, width: right - left + 1, height: bottom - top + 1 } : undefined
-  })() : undefined
-  const layerLeft = target.left || 0, layerTop = target.top || 0
-  const targetBounds = bounds || { left: layerLeft, top: layerTop, width: targetCanvas?.width || (target.right || 0) - layerLeft, height: targetCanvas?.height || (target.bottom || 0) - layerTop }
-  if (!targetBounds.width || !targetBounds.height) { bitmap.close(); throw new Error(`Não foi possível determinar a área de máscara da camada “${target.name || 'selecionada'}”.`) }
   const art = document.createElement('canvas')
-  art.width = Math.max(1, Math.round(targetBounds.width)); art.height = Math.max(1, Math.round(targetBounds.height))
+  art.width = Math.max(1, Math.round(bounds.width))
+  art.height = Math.max(1, Math.round(bounds.height))
   const artContext = art.getContext('2d')
   if (!artContext) { bitmap.close(); throw new Error('Não foi possível preparar a ilustração.') }
   fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height)
   bitmap.close()
 
   const projectedArt = document.createElement('canvas')
-  projectedArt.width = output.width; projectedArt.height = output.height
+  projectedArt.width = output.width
+  projectedArt.height = output.height
   const projectedContext = projectedArt.getContext('2d')
   if (!projectedContext) throw new Error('Não foi possível preparar a área de projeção.')
   let projected = false
   if (region) {
-    const shiftedCorners = region.map(({ x, y }) => ({ x: x - targetBounds.left, y: y - targetBounds.top }))
+    const shiftedCorners = region.map(({ x, y }) => ({ x: x - bounds.left, y: y - bounds.top }))
     projected = drawPerspective(projectedContext, art, shiftedCorners)
   }
-  if (!projected) projectedContext.drawImage(art, targetBounds.left, targetBounds.top)
-  if (alphaMask) { projectedContext.globalCompositeOperation = 'destination-in'; projectedContext.drawImage(alphaMask, 0, 0) }
+  if (!projected) projectedContext.drawImage(art, bounds.left, bounds.top)
+  projectedContext.globalCompositeOperation = 'destination-in'
+  projectedContext.drawImage(alphaMask, 0, 0)
   context.drawImage(projectedArt, 0, 0)
 
   for (let index = targetIndex - 1; index >= 0; index -= 1) drawLayer(mockup.layers[index])
@@ -432,6 +498,10 @@ export default function MockupStudio() {
   const readyCount = mockups.filter((item) => item.layers.some((layer) => layerId(layer) === item.targetId)).length
   const exportCount = mockups.length * artworks.length
   const targetLayer = selectedMockup?.layers.find((layer) => layerId(layer) === selectedMockup.targetId)
+  const targetMask = targetLayer ? layerMaskCanvas(targetLayer) : undefined
+  const targetLayerCanvas = targetLayer ? toCanvas(targetLayer) : undefined
+  const targetWidth = targetMask?.width || targetLayerCanvas?.width || Math.max(0, (targetLayer?.mask?.right ?? targetLayer?.right ?? 0) - (targetLayer?.mask?.left ?? targetLayer?.left ?? 0))
+  const targetHeight = targetMask?.height || targetLayerCanvas?.height || Math.max(0, (targetLayer?.mask?.bottom ?? targetLayer?.bottom ?? 0) - (targetLayer?.mask?.top ?? targetLayer?.top ?? 0))
   const artworkLabel = useMemo(() => artworks.length === 1 ? '1 ilustração' : `${artworks.length} ilustrações`, [artworks.length])
   const handlePreviewError = useCallback((error: string) => setMessage(error), [])
 
@@ -622,7 +692,7 @@ export default function MockupStudio() {
       anchor.download = `mockup-studio-${format}.zip`
       anchor.click()
       URL.revokeObjectURL(url)
-      setMessage(`${exportCount} ficheiros exportados em ${format.toUpperCase()}.`)
+      setMessage(`${exportCount} ${exportCount === 1 ? 'ficheiro exportado' : 'ficheiros exportados'} em ${format.toUpperCase()}.`)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Ocorreu um erro durante a exportação.')
     } finally {
@@ -676,7 +746,7 @@ export default function MockupStudio() {
               <div className="section-heading"><div><span className="section-kicker">01 — PRÉ-VISUALIZAÇÃO</span><h2>{viewMode === 'single' ? 'Mockup individual' : 'Toda a coleção'}</h2></div><div className="view-toggle" role="group" aria-label="Modo de visualização"><button type="button" aria-pressed={viewMode === 'single'} className={viewMode === 'single' ? 'view-toggle-active' : ''} onClick={() => setViewMode('single')}>Individual</button><button type="button" aria-pressed={viewMode === 'grid'} className={viewMode === 'grid' ? 'view-toggle-active' : ''} onClick={() => setViewMode('grid')}>Ver grupo</button></div></div>
               <div className={`preview-card${viewMode === 'grid' ? ' preview-card-gallery' : ''}`}><PreviewStage mockup={selectedMockup} artwork={selectedArtwork} targetId={selectedMockup?.targetId} allMockups={mockups} viewMode={viewMode} onSelectMockup={setSelectedMockupId} onPreviewError={handlePreviewError} /></div>
               {message && <div className={`status-message${message.includes('exportados') ? ' success-message' : ''}`} role="status">{message}</div>}
-              <div className="collection-strip"><div className="strip-heading"><div><span className="section-kicker">A TUA COLEÇÃO</span><h3>Mockups <span>{mockups.length.toString().padStart(2, '0')}</span></h3></div><button type="button" className="text-button" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}>Ver todos <ChevronDown size={14} /></button></div>
+              <div className="collection-strip"><div className="strip-heading"><div><span className="section-kicker">A TUA COLEÇÃO</span><h3>Mockups <span>{mockups.length.toString().padStart(2, '0')}</span></h3></div><button type="button" className="text-button" onClick={() => setViewMode('grid')}>Ver todos <ChevronDown size={14} /></button></div>
                 {mockups.length ? <div className="collection-grid">{mockups.map((mockup) => <div key={mockup.id} className={`collection-card${selectedMockup?.id === mockup.id ? ' collection-card-active' : ''}`} role="button" tabIndex={0} onClick={() => setSelectedMockupId(mockup.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedMockupId(mockup.id) }}><span className="collection-thumb"><img src={mockup.previewUrl} alt="" /><span className="file-type">PSD</span><button type="button" className="remove-item" aria-label={`Remover ${mockup.file.name}`} onClick={(event) => { event.stopPropagation(); removeMockup(mockup.id) }} onKeyDown={(event) => event.stopPropagation()}><X size={13} /></button></span><span className="collection-name">{mockup.file.name.replace(/\.psd$/i, '')}</span><span className="collection-meta">{mockup.width} × {mockup.height} px</span></div>)}<Dropzone title="Adicionar" subtitle="" accept=".psd,image/vnd.adobe.photoshop" multiple onFiles={addMockupFiles} compact /></div> : <div className="collection-empty"><div className="collection-empty-icon"><FileImage size={18} /></div><span><strong>Ainda sem mockups</strong><small>Adiciona um ficheiro PSD para começar a coleção.</small></span><button type="button" onClick={() => document.querySelector<HTMLInputElement>('.sidebar-upload input')?.click()}>Escolher ficheiros <Plus size={14} /></button></div>}
               </div>
             </div>
@@ -687,7 +757,7 @@ export default function MockupStudio() {
                 <div className="setting-block"><div className="setting-title-row"><div><span className="setting-index">A</span><div><h3>Camada de destino</h3><p>Onde inserir a ilustração</p></div></div></div>
                   {selectedMockup ? <label className="select-wrap"><span className="sr-only">Selecionar camada de destino</span><select value={selectedMockup.targetId} onChange={(event) => chooseTarget(selectedMockup.id, event.target.value)}>{selectedMockup.layers.map((layer) => <option key={layerId(layer)} value={layerId(layer)}>{layer.name || 'Camada sem nome'}</option>)}</select><ChevronDown size={15} /></label> : <div className="setting-placeholder">Adiciona um PSD para escolher a camada.</div>}
                   <button type="button" className={`auto-detect${automatic ? ' auto-active' : ''}`} onClick={toggleAutomatic}><span className="auto-icon"><Sparkles size={14} /></span><span><strong>Deteção automática</strong><small>{automatic ? 'Ativa · procura “mask”, “art” e “design”' : 'Desativada · seleção manual'}</small></span><span className="switch-track"><i /></span></button>
-                  {selectedMockup && <div className="layer-info"><Layers2 size={14} /><span>{targetLayer?.name || 'Camada selecionada'}</span><span>{targetLayer?.canvas?.width || Math.max(0, (targetLayer?.right || 0) - (targetLayer?.left || 0))} × {targetLayer?.canvas?.height || Math.max(0, (targetLayer?.bottom || 0) - (targetLayer?.top || 0))} px</span></div>}
+                  {selectedMockup && <div className="layer-info"><Layers2 size={14} /><span>{targetLayer?.name || 'Camada selecionada'}</span><span>{targetWidth} × {targetHeight} px</span></div>}
                 </div>
                 <div className="settings-divider" />
                 <div className="setting-block"><div className="setting-title-row"><div><span className="setting-index">B</span><div><h3>Ilustrações</h3><p>{artworks.length ? `${artworkLabel} adicionadas` : 'Adiciona os ficheiros para aplicar'}</p></div></div>{artworks.length > 0 && <span className="artwork-count">{artworks.length.toString().padStart(2, '0')}</span>}</div>
