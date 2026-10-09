@@ -380,13 +380,14 @@ button { color: inherit; }
 .view-toggle button.view-toggle-active { background: #edf3ee; color: #385d4c; font-weight: 600; }
 .preview-card-gallery { display: block; max-height: 560px; overflow: auto; padding: 16px; }
 .preview-gallery { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.gallery-card { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 5px; padding: 8px; border: 1px solid #e5e8e3; border-radius: 8px; background: #fff; text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s; }
+.gallery-card { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 6px; border: 1px solid #e5e8e3; border-radius: 8px; background: #fff; text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s; }
 .gallery-card:hover { transform: translateY(-1px); border-color: #bdcbbf; box-shadow: 0 5px 16px #34403812; }
 .gallery-card-selected { border-color: #91ad96; box-shadow: 0 0 0 2px #edf3ee; }
 .gallery-image { height: 170px; display: grid; place-items: center; overflow: hidden; border-radius: 5px; background: #f0f1ed; }
-.gallery-image img { width: 100%; height: 100%; object-fit: contain; }
-.gallery-card-name { overflow: hidden; color: #4b554c; font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.gallery-card-meta { color: #969d96; font-size: 8px; }
+.gallery-image img { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; object-position: center; }
+.gallery-card-details { min-width: 0; min-height: 26px; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 5px; }
+.gallery-card-name { min-width: 0; overflow: hidden; color: #4b554c; font-size: 9px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.gallery-card-meta { flex: 0 0 auto; color: #969d96; font-size: 8px; text-align: right; white-space: nowrap; }
 .project-dialog-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: #20282066; backdrop-filter: blur(3px); }
 .project-dialog { position: relative; width: min(100%, 390px); padding: 27px; border: 1px solid #e6e9e3; border-radius: 12px; background: #fff; box-shadow: 0 22px 70px #1e2b2029; }
 .dialog-close { position: absolute; top: 13px; right: 13px; display: grid; place-items: center; width: 29px; height: 29px; border: 1px solid #e8ebe6; border-radius: 7px; background: #fff; color: #7d857d; cursor: pointer; }
