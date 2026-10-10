@@ -541,8 +541,8 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   })
 }
 
-function fitImage(context: CanvasRenderingContext2D, image: CanvasImageSource, imageWidth: number, imageHeight: number, x: number, y: number, width: number, height: number) {
-  const scale = Math.max(width / imageWidth, height / imageHeight)
+function fitImage(context: CanvasRenderingContext2D, image: CanvasImageSource, imageWidth: number, imageHeight: number, x: number, y: number, width: number, height: number, zoom = 1) {
+  const scale = Math.max(width / imageWidth, height / imageHeight) * zoom
   const drawWidth = imageWidth * scale
   const drawHeight = imageHeight * scale
   context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight)
@@ -727,7 +727,7 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   art.height = Math.max(1, Math.round(1200 / Math.min(5, Math.max(0.2, planeRatio))))
   const artContext = art.getContext('2d')
   if (!artContext) { bitmap.close(); throw new Error('Não foi possível preparar a ilustração.') }
-  fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height)
+  fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height, 1.025)
   bitmap.close()
 
   const clippedArt = document.createElement('canvas')
@@ -783,6 +783,33 @@ function Dropzone({
 
 function PreviewStage({ mockup, artwork, targetId, allMockups, viewMode, onSelectMockup, onPreviewError }: { mockup?: Mockup; artwork?: Artwork; targetId?: string; allMockups: Mockup[]; viewMode: ViewMode; onSelectMockup: (id: string) => void; onPreviewError: (error: string) => void }) {
   const [renderedUrl, setRenderedUrl] = useState('')
+  const [zoom, setZoom] = useState(1)
+  const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 })
+
+  useEffect(() => {
+    setZoom(1)
+    setZoomOrigin({ x: 50, y: 50 })
+  }, [mockup?.id, artwork?.id])
+
+  const updateZoomOrigin = (event: React.MouseEvent<HTMLButtonElement> | React.WheelEvent<HTMLButtonElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect()
+    setZoomOrigin({
+      x: Math.max(0, Math.min(100, ((event.clientX - bounds.left) / bounds.width) * 100)),
+      y: Math.max(0, Math.min(100, ((event.clientY - bounds.top) / bounds.height) * 100)),
+    })
+  }
+
+  const handlePreviewClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+    updateZoomOrigin(event)
+    setZoom((current) => current > 1 ? 1 : 2)
+  }
+
+  const handlePreviewWheel = (event: React.WheelEvent<HTMLButtonElement>) => {
+    event.preventDefault()
+    updateZoomOrigin(event)
+    setZoom((current) => Math.max(1, Math.min(4, current * (event.deltaY < 0 ? 1.2 : 1 / 1.2))))
+  }
+
   useEffect(() => {
     let cancelled = false
     let objectUrl = ''
@@ -821,7 +848,21 @@ function PreviewStage({ mockup, artwork, targetId, allMockups, viewMode, onSelec
 
   return (
     <div className="preview-active">
-      <div className="preview-image-wrap"><img src={renderedUrl || mockup.previewUrl} alt={`Pré-visualização de ${mockup.file.name}${artwork ? ` com ${artwork.file.name}` : ''}`} /></div>
+      <button
+        className={`preview-image-wrap${zoom > 1 ? ' preview-image-zoomed' : ''}`}
+        type="button"
+        aria-label={zoom > 1 ? 'Reduzir zoom da pré-visualização' : 'Ampliar pré-visualização'}
+        title={zoom > 1 ? 'Clica para reduzir · roda o cursor para ajustar o zoom' : 'Clica ou roda o cursor para ampliar'}
+        onClick={handlePreviewClick}
+        onWheel={handlePreviewWheel}
+      >
+        <img
+          src={renderedUrl || mockup.previewUrl}
+          alt={`Pré-visualização de ${mockup.file.name}${artwork ? ` com ${artwork.file.name}` : ''}`}
+          draggable={false}
+          style={{ transform: `scale(${zoom})`, transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%` }}
+        />
+      </button>
       <div className="preview-caption"><span><strong>{mockup.file.name}</strong><small>{mockup.width} × {mockup.height} px</small></span><span className="preview-ready"><Check size={13} /> {artwork ? 'Pré-visualização atualizada' : 'Mockup carregado'}</span></div>
     </div>
   )
