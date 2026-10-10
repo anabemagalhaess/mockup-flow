@@ -13,9 +13,11 @@ import {
   Layers2,
   LoaderCircle,
   Plus,
-  ScanLine,
+  RotateCcw,
   Sparkles,
   Upload,
+  ZoomIn,
+  ZoomOut,
   X,
 } from 'lucide-react'
 
@@ -700,7 +702,32 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   const geometry = colorKey && alphaMask === colorKey.alphaMask ? colorKey.geometry : analyzeMask(alphaMask)
   if (!geometry) throw new Error('Não foi possível ler a máscara da camada de destino.')
   if (!geometry.bounds) throw new Error(`A máscara da camada “${target.name || 'selecionada'}” está vazia.`)
-  const bounds = geometry.bounds
+  const maskBounds = geometry.bounds
+  const maskCenter = geometry.corners
+    ? geometry.corners.reduce((center, point) => ({ x: center.x + point.x / geometry.corners!.length, y: center.y + point.y / geometry.corners!.length }), { x: 0, y: 0 })
+    : { x: maskBounds.left + maskBounds.width / 2, y: maskBounds.top + maskBounds.height / 2 }
+  const maskBleed = 1.012
+  const expandedMask = document.createElement('canvas')
+  expandedMask.width = alphaMask.width
+  expandedMask.height = alphaMask.height
+  const expandedMaskContext = expandedMask.getContext('2d')
+  if (!expandedMaskContext) throw new Error('Não foi possível ampliar a máscara de recorte.')
+  expandedMaskContext.translate(maskCenter.x, maskCenter.y)
+  expandedMaskContext.scale(maskBleed, maskBleed)
+  expandedMaskContext.translate(-maskCenter.x, -maskCenter.y)
+  expandedMaskContext.drawImage(alphaMask, 0, 0)
+  alphaMask = expandedMask
+
+  const bounds = {
+    left: maskCenter.x + (maskBounds.left - maskCenter.x) * maskBleed,
+    top: maskCenter.y + (maskBounds.top - maskCenter.y) * maskBleed,
+    width: maskBounds.width * maskBleed,
+    height: maskBounds.height * maskBleed,
+  }
+  const perspectiveCorners = geometry.corners?.map((point) => ({
+    x: maskCenter.x + (point.x - maskCenter.x) * maskBleed,
+    y: maskCenter.y + (point.y - maskCenter.y) * maskBleed,
+  }))
 
   const output = document.createElement('canvas')
   output.width = mockup.width
@@ -719,7 +746,6 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
     for (let index = mockup.layers.length - 1; index > targetIndex; index -= 1) drawLayer(mockup.layers[index])
   }
 
-  const perspectiveCorners = geometry.corners
   const bitmap = await createImageBitmap(artwork.file)
   const art = document.createElement('canvas')
   const planeRatio = perspectiveCorners ? getPerspectiveAspectRatio(perspectiveCorners) : bounds.width / bounds.height
@@ -727,7 +753,7 @@ async function renderMockup(mockup: Mockup, artwork: Artwork, targetId: string, 
   art.height = Math.max(1, Math.round(1200 / Math.min(5, Math.max(0.2, planeRatio))))
   const artContext = art.getContext('2d')
   if (!artContext) { bitmap.close(); throw new Error('Não foi possível preparar a ilustração.') }
-  fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height, 1.025)
+  fitImage(artContext, bitmap, bitmap.width, bitmap.height, 0, 0, art.width, art.height)
   bitmap.close()
 
   const clippedArt = document.createElement('canvas')
@@ -810,6 +836,11 @@ function PreviewStage({ mockup, artwork, targetId, allMockups, viewMode, onSelec
     setZoom((current) => Math.max(1, Math.min(4, current * (event.deltaY < 0 ? 1.2 : 1 / 1.2))))
   }
 
+  const resetZoom = () => {
+    setZoom(1)
+    setZoomOrigin({ x: 50, y: 50 })
+  }
+
   useEffect(() => {
     let cancelled = false
     let objectUrl = ''
@@ -848,21 +879,29 @@ function PreviewStage({ mockup, artwork, targetId, allMockups, viewMode, onSelec
 
   return (
     <div className="preview-active">
-      <button
-        className={`preview-image-wrap${zoom > 1 ? ' preview-image-zoomed' : ''}`}
-        type="button"
-        aria-label={zoom > 1 ? 'Reduzir zoom da pré-visualização' : 'Ampliar pré-visualização'}
-        title={zoom > 1 ? 'Clica para reduzir · roda o cursor para ajustar o zoom' : 'Clica ou roda o cursor para ampliar'}
-        onClick={handlePreviewClick}
-        onWheel={handlePreviewWheel}
-      >
-        <img
-          src={renderedUrl || mockup.previewUrl}
-          alt={`Pré-visualização de ${mockup.file.name}${artwork ? ` com ${artwork.file.name}` : ''}`}
-          draggable={false}
-          style={{ transform: `scale(${zoom})`, transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%` }}
-        />
-      </button>
+      <div className="preview-viewport">
+        <button
+          className={`preview-image-wrap${zoom > 1 ? ' preview-image-zoomed' : ''}`}
+          type="button"
+          aria-label={zoom > 1 ? 'Reduzir zoom da pré-visualização' : 'Ampliar pré-visualização'}
+          title={zoom > 1 ? 'Clica para reduzir · roda para ajustar o zoom' : 'Clica ou roda para ampliar'}
+          onClick={handlePreviewClick}
+          onWheel={handlePreviewWheel}
+        >
+          <img
+            src={renderedUrl || mockup.previewUrl}
+            alt={`Pré-visualização de ${mockup.file.name}${artwork ? ` com ${artwork.file.name}` : ''}`}
+            draggable={false}
+            style={{ transform: `scale(${zoom})`, transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%` }}
+          />
+        </button>
+        <div className="preview-zoom-controls" role="group" aria-label="Controlos de zoom">
+          <button type="button" aria-label="Diminuir zoom" title="Diminuir zoom" disabled={zoom <= 1} onClick={() => setZoom((current) => Math.max(1, current - 0.25))}><ZoomOut size={15} /></button>
+          <span aria-live="polite">{Math.round(zoom * 100)}%</span>
+          <button type="button" aria-label="Aumentar zoom" title="Aumentar zoom" disabled={zoom >= 4} onClick={() => setZoom((current) => Math.min(4, current + 0.25))}><ZoomIn size={15} /></button>
+          <button type="button" aria-label="Repor zoom" title="Repor zoom" disabled={zoom === 1} onClick={resetZoom}><RotateCcw size={14} /></button>
+        </div>
+      </div>
       <div className="preview-caption"><span><strong>{mockup.file.name}</strong><small>{mockup.width} × {mockup.height} px</small></span><span className="preview-ready"><Check size={13} /> {artwork ? 'Pré-visualização atualizada' : 'Mockup carregado'}</span></div>
     </div>
   )
