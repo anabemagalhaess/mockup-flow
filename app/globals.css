@@ -379,12 +379,12 @@ button { color: inherit; }
 .view-toggle button { min-height: 28px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: #80877f; font-size: 9px; cursor: pointer; }
 .view-toggle button.view-toggle-active { background: #edf3ee; color: #385d4c; font-weight: 600; }
 .preview-card-gallery { display: block; overflow: visible; padding: 16px; }
-.preview-gallery { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.preview-gallery { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
 .gallery-card { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 6px; border: 1px solid #e5e8e3; border-radius: 8px; background: #fff; text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s; }
-.gallery-card:hover { transform: translateY(-1px); border-color: #bdcbbf; box-shadow: 0 5px 16px #34403812; }
+.gallery-card:hover { transform: translateY(-1px); border-color: #bdcbb9; box-shadow: 0 5px 16px #34403812; }
 .gallery-card-selected { border-color: #91ad96; box-shadow: 0 0 0 2px #edf3ee; }
-.gallery-image { height: 170px; display: grid; place-items: center; overflow: hidden; border-radius: 5px; background: #f0f1ed; }
-.gallery-image img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: center; }
+.gallery-image { min-height: 0; max-height: min(65vh, 640px); display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 5px; background: #f0f1ed; }
+.gallery-image img { display: block; width: 100%; height: auto; max-height: min(65vh, 640px); object-fit: contain; object-position: center; }
 .gallery-card-details { min-width: 0; min-height: 26px; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 5px; }
 .gallery-card-name { min-width: 0; overflow: hidden; color: #4b554c; font-size: 9px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .gallery-card-meta { flex: 0 0 auto; color: #969d96; font-size: 8px; text-align: right; white-space: nowrap; }
@@ -400,8 +400,8 @@ button { color: inherit; }
 .project-dialog input:focus { border-color: #91ad96; box-shadow: 0 0 0 3px #edf3ee; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 13px; }
 @media (max-width: 1080px) { .project-switcher { min-width: 160px; } .project-switcher select { max-width: 110px; } }
-@media (max-width: 780px) { .page-actions { flex-wrap: wrap; justify-content: flex-end; } .project-switcher { min-width: 155px; } .gallery-image { height: 140px; } }
-@media (max-width: 520px) { .page-heading { flex-direction: column; } .page-actions { width: 100%; justify-content: space-between; } .page-actions .button { width: auto; min-width: 36px; overflow: visible; padding: 0 9px; font-size: 9px; } .page-actions .button svg { flex-basis: 14px; } .project-switcher { min-width: 0; max-width: calc(100% - 45px); flex: 1; } .project-switcher select { max-width: none; } .collection-status { display: none; } .view-toggle button { padding: 0 7px; font-size: 8px; } .preview-card-gallery { padding: 10px; } .preview-gallery { grid-template-columns: 1fr 1fr; gap: 7px; } .gallery-card { padding: 5px; } .gallery-image { height: 105px; } .gallery-card-name { font-size: 9px; } .project-dialog { padding: 24px 20px; } }
-@media (min-width: 1600px) { .gallery-image { height: 215px; } }
+@media (max-width: 780px) { .page-actions { flex-wrap: wrap; justify-content: flex-end; } .project-switcher { min-width: 155px; } }
+@media (max-width: 520px) { .page-heading { flex-direction: column; } .page-actions { width: 100%; justify-content: space-between; } .page-actions .button { width: auto; min-width: 36px; overflow: visible; padding: 0 9px; font-size: 9px; } .page-actions .button svg { flex-basis: 14px; } .project-switcher { min-width: 0; max-width: calc(100% - 45px); flex: 1; } .project-switcher select { max-width: none; } .collection-status { display: none; } .view-toggle button { padding: 0 7px; font-size: 8px; } .preview-card-gallery { padding: 10px; } .preview-gallery { grid-template-columns: 1fr 1fr; gap: 7px; } .gallery-card { padding: 5px; } .gallery-card-name { font-size: 9px; } .project-dialog { padding: 24px 20px; } }
+
 @media (prefers-reduced-motion: reduce) { .gallery-card { transition: none; } }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #7b9a82; outline-offset: 2px; }
